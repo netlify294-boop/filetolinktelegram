@@ -27,7 +27,7 @@ API_ID            = int(os.environ.get("API_ID", "0"))
 API_HASH          = os.environ.get("API_HASH", "")
 SESSION_STRING    = os.environ.get("SESSION_STRING", "")
 ADMIN_IDS         = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
-TARGET_BOT        = "BookTherapyBot"
+TARGET_BOT        = "BookTherepybot"
 
 # Data files
 SETTINGS_FILE  = "settings.json"
