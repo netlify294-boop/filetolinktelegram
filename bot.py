@@ -27,7 +27,7 @@ API_HASH          = os.environ.get("API_HASH", "")           # my.telegram.org s
 SESSION_STRING    = os.environ.get("SESSION_STRING", "")     # generate_session.py se
 
 # Target bot jisko link bhejna hai
-TARGET_BOT        = "BookTherapyBot"
+TARGET_BOT        = "BookTherepybot"
 
 # Custom thumbnail ka path (Render pe upload karo ya URL)
 THUMBNAIL_PATH    = os.environ.get("THUMBNAIL_PATH", "thumb.jpg")
