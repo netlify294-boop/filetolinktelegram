@@ -1,24 +1,22 @@
 import logging
 import os
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-import json
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes, Application
+    filters, ContextTypes
 )
 
 # ============================================================
-#  CONFIG — Render pe Environment Variables mein set karo
+#  CONFIG — Render Environment Variables
 # ============================================================
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
 DB_CHANNEL_ID     = int(os.environ.get("DB_CHANNEL_ID", "0"))
 FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "")
 BOT_USERNAME      = os.environ.get("BOT_USERNAME", "")
-WEBHOOK_URL       = os.environ.get("WEBHOOK_URL", "")   # e.g. https://my-bot.onrender.com
-PORT              = int(os.environ.get("PORT", "8443"))  # Render khud set karta hai
+WEBHOOK_URL       = os.environ.get("WEBHOOK_URL", "")
+PORT              = int(os.environ.get("PORT", "10000"))
 # ============================================================
 
 logging.basicConfig(
@@ -27,8 +25,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ─── Handlers ───────────────────────────────────────────────
 
 async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not FORCE_SUB_CHANNEL:
@@ -109,8 +105,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             media_type = "🎬 Video"
             size_mb = round(msg.video.file_size / 1024 / 1024, 1) if msg.video.file_size else "?"
             dur = msg.video.duration or 0
-            duration = f"{dur // 60}:{dur % 60:02d}"
-            details = f"📐 Size: {size_mb} MB  |  ⏱ Duration: {duration}"
+            details = f"📐 Size: {size_mb} MB  |  ⏱ Duration: {dur // 60}:{dur % 60:02d}"
         elif msg.document:
             media_type = "📄 Document"
             size_mb = round(msg.document.file_size / 1024 / 1024, 1) if msg.document.file_size else "?"
@@ -162,15 +157,13 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 *Bot Status*\n\n"
         "✅ Bot chal raha hai (Webhook mode)\n"
         f"📦 DB Channel: `{DB_CHANNEL_ID}`\n"
-        f"📢 Force Sub: `{FORCE_SUB_CHANNEL or 'Off'}`\n"
-        f"🌐 Webhook: `{WEBHOOK_URL}`",
+        f"📢 Force Sub: `{FORCE_SUB_CHANNEL or 'Off'}`",
         parse_mode="Markdown"
     )
 
 
-# ─── Main ───────────────────────────────────────────────────
-
-def main():
+# ─── Fix: asyncio event loop manually banao (Python 3.14 fix) ───
+async def run():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN set nahi hai!")
     if not DB_CHANNEL_ID:
@@ -191,7 +184,9 @@ def main():
     logger.info(f"Webhook URL: {full_webhook_url}")
     logger.info(f"Port: {PORT}")
 
-    app.run_webhook(
+    await app.initialize()
+    await app.start()
+    await app.updater.start_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=webhook_path,
@@ -199,6 +194,16 @@ def main():
         drop_pending_updates=True,
     )
 
+    logger.info("Bot chal raha hai! Ctrl+C se band karo.")
+
+    # Hamesha chalta rahe jab tak stop signal na aaye
+    try:
+        await asyncio.Event().wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(run())
