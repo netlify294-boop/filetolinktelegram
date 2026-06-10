@@ -237,11 +237,24 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     }
 
     try:
-        await telethon_client.send_message(TARGET_BOT, link_to_process)
-        logger.info(f"Link {link_to_process} BookTherapyBot ko bheja (user: {user.id})")
+        # Entity pehle resolve karo — username ya peer se
+        try:
+            target_entity = await telethon_client.get_entity(TARGET_BOT)
+        except Exception:
+            # Fallback: direct username string
+            target_entity = TARGET_BOT
+
+        sent = await telethon_client.send_message(target_entity, link_to_process)
+        logger.info(f"✅ Link bheja BookTherepybot ko | msg_id={sent.id} | user={user.id} | link={link_to_process}")
+
     except Exception as e:
-        logger.error(f"Telethon send error: {e}")
-        await processing_msg.edit_text("❌ Link bhejne mein error aaya. Dobara try karo.")
+        logger.error(f"Telethon send error: {type(e).__name__}: {e}")
+        await processing_msg.edit_text(
+            f"❌ Link BookTherepybot ko bhejne mein error aaya.\n\n"
+            f"Error: `{type(e).__name__}`\n\n"
+            "Kuch der baad dobara try karo.",
+            parse_mode="Markdown"
+        )
 
 
 # ════════════════════════════════════════════════════════════
@@ -484,12 +497,15 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+
+    # Non-admin — seedha user handler pe bhejo
     if not is_admin(user.id):
+        await handle_user_message(update, context)
         return
 
     action = context.user_data.get("admin_action")
     if not action:
-        # Normal user message handle karo
+        # Admin ne koi admin action set nahi kiya — normal user ki tarah handle karo
         await handle_user_message(update, context)
         return
 
