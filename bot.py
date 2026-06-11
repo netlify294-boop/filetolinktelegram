@@ -49,6 +49,9 @@ logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r'https?://[^\s]+')
 telethon_client: TelegramClient = None
 
+# Loop rokne ke liye processed message IDs track karo
+processed_msg_ids: set = set()
+
 # ════════════════════════════════════════════════════════════
 #  SECURE TOKEN — link guessing se bachao
 # ════════════════════════════════════════════════════════════
@@ -379,6 +382,11 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not has_media:
         return
 
+    # Agar yeh message humne khud banaya hai to ignore karo
+    if msg.message_id in processed_msg_ids:
+        processed_msg_ids.discard(msg.message_id)
+        return
+
     try:
         # Seedha is message ka link banao — koi forward nahi
         file_ref = msg.message_id
@@ -406,6 +414,8 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                     )
                     await telethon_client.delete_messages(msg.chat_id, [file_ref])
                     file_ref = new_msg.id
+                    # Naya message ID ko processed mark karo — loop nahi hoga
+                    processed_msg_ids.add(file_ref)
                     file_arg = make_file_arg(file_ref)
                     link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
                     logger.info(f"✅ Thumbnail inject done, new msg_id={file_ref}")
