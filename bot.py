@@ -169,26 +169,18 @@ async def send_file(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str
     if is_banned(user.id):
         await update.message.reply_text("🚫 Tum banned ho.")
         return
+
+    msg_id = int(arg.replace("file_", ""))
+
     try:
-        msg_id = int(arg.replace("file_", ""))
-
-        # Telethon se copy karo — "Forwarded from" nahi aayega
-        db_msg = await telethon_client.get_messages(DB_CHANNEL_ID, ids=msg_id)
-        if not db_msg:
-            raise Exception("Message nahi mila")
-
-        caption = db_msg.message or ""
-
-        await telethon_client.send_file(
-            user.id,
-            file=db_msg.media,
-            caption=caption,
-            force_document=False
+        await context.bot.forward_message(
+            chat_id=update.effective_chat.id,
+            from_chat_id=DB_CHANNEL_ID,
+            message_id=msg_id
         )
-        logger.info(f"File {msg_id} copy karke bheji user {user.id} ko")
-
+        logger.info(f"File {msg_id} forward kari user {user.id} ko")
     except Exception as e:
-        logger.error(f"File bhejne mein error: {e}")
+        logger.error(f"Forward fail: {type(e).__name__}: {e}")
         await update.message.reply_text("❌ File nahi mili. Link expire ho gaya hoga.")
 
 
@@ -245,12 +237,12 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             target_entity = TARGET_BOT
 
         sent = await telethon_client.send_message(target_entity, link_to_process)
-        logger.info(f"✅ Link bheja BookTherepybot ko | msg_id={sent.id} | user={user.id} | link={link_to_process}")
+        logger.info(f"✅ Link bheja BookTherapyBot ko | msg_id={sent.id} | user={user.id} | link={link_to_process}")
 
     except Exception as e:
         logger.error(f"Telethon send error: {type(e).__name__}: {e}")
         await processing_msg.edit_text(
-            f"❌ Link BookTherepybot ko bhejne mein error aaya.\n\n"
+            f"❌ Link BookTherapyBot ko bhejne mein error aaya.\n\n"
             f"Error: `{type(e).__name__}`\n\n"
             "Kuch der baad dobara try karo.",
             parse_mode="Markdown"
