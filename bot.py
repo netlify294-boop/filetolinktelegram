@@ -373,6 +373,10 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not msg:
         return
 
+    # ⚠️ DB channel ke posts ignore karo — infinite loop rokne ke liye
+    if msg.chat_id == DB_CHANNEL_ID:
+        return
+
     has_media = any([msg.video, msg.document, msg.audio,
                      msg.photo, msg.animation, msg.voice, msg.video_note])
     if not has_media:
