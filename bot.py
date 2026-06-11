@@ -374,7 +374,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     # ⚠️ DB channel ke posts ignore karo — infinite loop rokne ke liye
-    if msg.chat_id == DB_CHANNEL_ID:
+    if int(msg.chat_id) == int(DB_CHANNEL_ID):
         return
 
     has_media = any([msg.video, msg.document, msg.audio,
@@ -410,22 +410,20 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             try:
                 db_msg = await telethon_client.get_messages(DB_CHANNEL_ID, ids=file_ref)
                 if db_msg and db_msg.media:
-                    # Naya caption wala message send karo thumb ke saath, purana delete karo
                     new_msg = await telethon_client.send_file(
                         DB_CHANNEL_ID,
                         file=db_msg.media,
                         caption=db_msg.message or "",
                         thumb=THUMBNAIL_PATH
                     )
-                    # Purana forward delete karo
                     await telethon_client.delete_messages(DB_CHANNEL_ID, [file_ref])
-                    # Naya message ID use karo
                     file_ref = new_msg.id
                     file_arg = make_file_arg(file_ref)
                     link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
                     logger.info(f"✅ Thumbnail set, new msg_id={file_ref}")
             except Exception as e:
-                logger.warning(f"Thumbnail error: {e}")
+                # Thumbnail fail hone pe bhi link wahi rahega — user ko milega
+                logger.warning(f"Thumbnail error (link safe hai): {e}")
 
         # Media details
         if msg.video:
