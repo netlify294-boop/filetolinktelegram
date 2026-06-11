@@ -30,6 +30,7 @@ API_HASH          = os.environ.get("API_HASH", "")
 SESSION_STRING    = os.environ.get("SESSION_STRING", "")
 ADMIN_IDS         = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 TARGET_BOT        = "BookTherepybot"
+BOOKBOT_CHANNEL   = int(os.environ.get("BOOKBOT_CHANNEL", "0"))  # BookTherapyBot ka channel ID
 
 # Secret key for secure tokens
 SECRET_KEY        = os.environ.get("SECRET_KEY", BOT_TOKEN[:20])
@@ -373,57 +374,16 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not msg:
         return
 
-    # ⚠️ DB channel ke posts ignore karo — infinite loop rokne ke liye
-    if int(msg.chat_id) == int(DB_CHANNEL_ID):
-        return
-
     has_media = any([msg.video, msg.document, msg.audio,
                      msg.photo, msg.animation, msg.voice, msg.video_note])
     if not has_media:
         return
 
     try:
-        forwarded = await context.bot.forward_message(
-            chat_id=DB_CHANNEL_ID,
-            from_chat_id=msg.chat_id,
-            message_id=msg.message_id
-        )
-        file_ref = forwarded.message_id
-
-        # Secure link banao
+        # Seedha is message ka link banao — koi forward nahi
+        file_ref = msg.message_id
         file_arg = make_file_arg(file_ref)
         link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
-
-        # ── Thumbnail set karo Telethon se ──────────────────
-        # Agar thumb.jpg nahi hai lekin file_id saved hai — re-download karo
-        if not os.path.exists(THUMBNAIL_PATH) and os.path.exists(THUMB_FILE_ID_FILE):
-            try:
-                with open(THUMB_FILE_ID_FILE) as f:
-                    saved_fid = f.read().strip()
-                tg_file = await context.bot.get_file(saved_fid)
-                await tg_file.download_to_drive(THUMBNAIL_PATH)
-                logger.info("Thumbnail re-downloaded from Telegram")
-            except Exception as e:
-                logger.warning(f"Thumb re-download fail: {e}")
-
-        if os.path.exists(THUMBNAIL_PATH) and msg.video:
-            try:
-                db_msg = await telethon_client.get_messages(DB_CHANNEL_ID, ids=file_ref)
-                if db_msg and db_msg.media:
-                    new_msg = await telethon_client.send_file(
-                        DB_CHANNEL_ID,
-                        file=db_msg.media,
-                        caption=db_msg.message or "",
-                        thumb=THUMBNAIL_PATH
-                    )
-                    await telethon_client.delete_messages(DB_CHANNEL_ID, [file_ref])
-                    file_ref = new_msg.id
-                    file_arg = make_file_arg(file_ref)
-                    link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
-                    logger.info(f"✅ Thumbnail set, new msg_id={file_ref}")
-            except Exception as e:
-                # Thumbnail fail hone pe bhi link wahi rahega — user ko milega
-                logger.warning(f"Thumbnail error (link safe hai): {e}")
 
         # Media details
         if msg.video:
