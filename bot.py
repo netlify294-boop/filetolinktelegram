@@ -38,7 +38,8 @@ SETTINGS_FILE  = "settings.json"
 BANNED_FILE    = "banned.json"
 USERS_FILE     = "users.json"
 USAGE_FILE     = "usage.json"
-THUMBNAIL_PATH = "thumb.jpg"
+THUMBNAIL_PATH = "/tmp/thumb.jpg"
+THUMB_FILE_ID_FILE = "/tmp/thumb_file_id.txt"
 # ============================================================
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
@@ -390,6 +391,17 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
 
         # ── Thumbnail set karo Telethon se ──────────────────
+        # Agar thumb.jpg nahi hai lekin file_id saved hai — re-download karo
+        if not os.path.exists(THUMBNAIL_PATH) and os.path.exists(THUMB_FILE_ID_FILE):
+            try:
+                with open(THUMB_FILE_ID_FILE) as f:
+                    saved_fid = f.read().strip()
+                tg_file = await context.bot.get_file(saved_fid)
+                await tg_file.download_to_drive(THUMBNAIL_PATH)
+                logger.info("Thumbnail re-downloaded from Telegram")
+            except Exception as e:
+                logger.warning(f"Thumb re-download fail: {e}")
+
         if os.path.exists(THUMBNAIL_PATH) and msg.video:
             try:
                 db_msg = await telethon_client.get_messages(DB_CHANNEL_ID, ids=file_ref)
@@ -496,7 +508,7 @@ async def show_admin_panel(update, context):
     banned = get_banned()
     pending = sum(1 for k in context.bot_data if str(k).startswith("pending_"))
     settings = get_settings()
-    thumb_status = "✅ Set hai" if os.path.exists(THUMBNAIL_PATH) else "❌ Nahi"
+    thumb_status = "✅ Set hai" if (os.path.exists(THUMBNAIL_PATH) or os.path.exists(THUMB_FILE_ID_FILE)) else "❌ Nahi"
     limit = settings.get("daily_limit", 5)
     del_sec = settings.get("auto_delete_seconds", 0)
     del_str = f"{del_sec}s" if del_sec else "Off"
@@ -661,10 +673,15 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action == "set_thumb":
         if msg.photo:
             photo = msg.photo[-1]
+            # File ID save karo (permanent)
+            with open(THUMB_FILE_ID_FILE, "w") as f:
+                f.write(photo.file_id)
+            # Download bhi karo (Telethon ke liye)
             file = await context.bot.get_file(photo.file_id)
             await file.download_to_drive(THUMBNAIL_PATH)
             context.user_data.pop("admin_action", None)
             await msg.reply_text("✅ *Thumbnail save ho gaya!*\nAb se naye videos pe yahi thumbnail lagega.", parse_mode="Markdown")
+            logger.info(f"Thumbnail saved: {photo.file_id}")
         else:
             await msg.reply_text("⚠️ Photo bhejo!")
 
