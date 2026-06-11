@@ -385,6 +385,33 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_arg = make_file_arg(file_ref)
         link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
 
+        # ── Thumbnail inject (no download/upload) ────────────
+        if msg.video:
+            try:
+                tg_msg = await telethon_client.get_messages(msg.chat_id, ids=file_ref)
+                if tg_msg and tg_msg.media and hasattr(tg_msg.media, 'document'):
+                    doc = tg_msg.media.document
+                    # Thumbnail set hai to use karo, warna None (existing hatega)
+                    if os.path.exists(THUMBNAIL_PATH):
+                        thumb = await telethon_client.upload_file(THUMBNAIL_PATH)
+                    else:
+                        thumb = None
+                    # Same file_id reuse — sirf thumbnail naya
+                    new_msg = await telethon_client.send_file(
+                        msg.chat_id,
+                        file=doc,
+                        thumb=thumb,
+                        caption=tg_msg.message or "",
+                        supports_streaming=True
+                    )
+                    await telethon_client.delete_messages(msg.chat_id, [file_ref])
+                    file_ref = new_msg.id
+                    file_arg = make_file_arg(file_ref)
+                    link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
+                    logger.info(f"✅ Thumbnail inject done, new msg_id={file_ref}")
+            except Exception as e:
+                logger.warning(f"Thumbnail inject fail, original link use hoga: {e}")
+
         # Media details
         if msg.video:
             media_type = "🎬 Video"
