@@ -3,24 +3,22 @@ import os
 import asyncio
 import re
 import json
-import time
-import hashlib
-import hmac
-from datetime import datetime, date
+from datetime import date
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     filters, ContextTypes, CallbackQueryHandler
 )
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
 # ============================================================
 #  CONFIG
 # ============================================================
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
-DB_CHANNEL_ID     = int(os.environ.get("DB_CHANNEL_ID", "0"))
+DB_CHANNEL_ID     = int(os.environ.get("DB_CHANNEL_ID", "0"))      # Channel 1 — BookTherapyBot yahan upload karta hai
+FINAL_CHANNEL_ID  = int(os.environ.get("FINAL_CHANNEL_ID", "0"))   # Channel 2 — thumbnail changed video yahan
 FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "")
 BOT_USERNAME      = os.environ.get("BOT_USERNAME", "")
 WEBHOOK_URL       = os.environ.get("WEBHOOK_URL", "")
@@ -29,13 +27,9 @@ API_ID            = int(os.environ.get("API_ID", "0"))
 API_HASH          = os.environ.get("API_HASH", "")
 SESSION_STRING    = os.environ.get("SESSION_STRING", "")
 ADMIN_IDS         = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
-TARGET_BOT        = "BookTherepybot"
-THUMB_BOT         = "VideosThumb_hgbot"  # Thumbnail change karne wala bot
-FINAL_CHANNEL_ID  = int(os.environ.get("FINAL_CHANNEL_ID", "0"))  # Channel 2 — final videos yahan
-BOOKBOT_CHANNEL   = int(os.environ.get("BOOKBOT_CHANNEL", "0"))  # BookTherapyBot ka channel ID
-
-# Secret key for secure tokens
 SECRET_KEY        = os.environ.get("SECRET_KEY", BOT_TOKEN[:20])
+TARGET_BOT        = "BookTherepybot"
+THUMB_BOT         = "VideosThumb_hgbot"
 
 SETTINGS_FILE  = "settings.json"
 BANNED_FILE    = "banned.json"
@@ -50,45 +44,39 @@ logger = logging.getLogger(__name__)
 
 URL_PATTERN = re.compile(r'https?://[^\s]+')
 telethon_client: TelegramClient = None
+application_ref = []
 
-# Loop rokne ke liye processed message IDs track karo
+# Processed IDs — loop rokne ke liye
 processed_msg_ids: set = set()
 
-# Thumb bot ka response wait karne ke liye
-# {telethon_msg_id: user_pending_data}
+# ThumbBot se response ka wait
+# {sent_msg_id: {chat_id, caption, user_pending_key}}
 thumb_pending: dict = {}
 
 # ════════════════════════════════════════════════════════════
-#  SECURE TOKEN — link guessing se bachao
+#  SECURE TOKEN
 # ════════════════════════════════════════════════════════════
 
+import hashlib, hmac as hmac_mod
+
 def make_token(msg_id: int) -> str:
-    """msg_id ke liye ek secure HMAC token banao"""
     key = SECRET_KEY.encode()
-    msg = str(msg_id).encode()
-    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:12]
+    return hmac_mod.new(key, str(msg_id).encode(), hashlib.sha256).hexdigest()[:12]
 
 def verify_token(msg_id: int, token: str) -> bool:
-    """Token valid hai ya nahi check karo"""
-    return hmac.compare_digest(make_token(msg_id), token)
+    return hmac_mod.compare_digest(make_token(msg_id), token)
 
 def make_file_arg(msg_id: int) -> str:
-    """file_MSGID_TOKEN format"""
     return f"file_{msg_id}_{make_token(msg_id)}"
 
 def parse_file_arg(arg: str):
-    """(msg_id, valid) return karo"""
     parts = arg.replace("file_", "").split("_")
     if len(parts) == 2:
         try:
             msg_id = int(parts[0])
-            token = parts[1]
-            return msg_id, verify_token(msg_id, token)
+            return msg_id, verify_token(msg_id, parts[1])
         except Exception:
             pass
-    elif len(parts) == 1:
-        # Purane links bina token ke — reject karo
-        return None, False
     return None, False
 
 # ════════════════════════════════════════════════════════════
@@ -110,14 +98,7 @@ def save_json(path, data):
 
 def get_settings():
     return load_json(SETTINGS_FILE, {
-        "start_msg": (
-            "👋 *Namaste {name}!*\n\n"
-            "🤖 Main File Share Bot hu.\n\n"
-            "📥 *File Download:* Channel pe upload hone wali har video ka link milega\n\n"
-            "🔗 *Link Process:* Koi bhi link bhejo — main video process karke link dunga\n\n"
-            "━━━━━━━━━━━━━━━━━\n"
-            "👇 Seedha koi link bhejo!"
-        ),
+        "start_msg": "👋 *Namaste {name}!*\n\n🤖 Main File Share Bot hu.\n\n📥 *File Download:* Channel pe upload hone wali har video ka link milega\n\n🔗 *Link Process:* Koi bhi link bhejo — main video process karke link dunga\n\n━━━━━━━━━━━━━━━━━\n👇 Seedha koi link bhejo!",
         "daily_limit": 5,
         "auto_delete_seconds": 0,
         "delete_msg": "🗑 Yeh file {time} baad delete ho jayegi.",
@@ -130,63 +111,58 @@ def save_settings(data):
 def get_banned():
     return load_json(BANNED_FILE, [])
 
-def is_banned(user_id):
-    return user_id in get_banned()
+def is_banned(uid):
+    return uid in get_banned()
 
-def ban_user(user_id):
-    banned = get_banned()
-    if user_id not in banned:
-        banned.append(user_id)
-        save_json(BANNED_FILE, banned)
+def ban_user(uid):
+    b = get_banned()
+    if uid not in b:
+        b.append(uid)
+        save_json(BANNED_FILE, b)
 
-def unban_user(user_id):
-    banned = get_banned()
-    if user_id in banned:
-        banned.remove(user_id)
-        save_json(BANNED_FILE, banned)
+def unban_user(uid):
+    b = get_banned()
+    if uid in b:
+        b.remove(uid)
+        save_json(BANNED_FILE, b)
 
-def add_user(user_id, name):
-    users = load_json(USERS_FILE, {})
-    users[str(user_id)] = name
-    save_json(USERS_FILE, users)
+def add_user(uid, name):
+    u = load_json(USERS_FILE, {})
+    u[str(uid)] = name
+    save_json(USERS_FILE, u)
 
 def get_all_users():
     return load_json(USERS_FILE, {})
 
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def is_admin(uid):
+    return uid in ADMIN_IDS
 
-# ── Daily limit tracking ────────────────────────────────────
-def get_usage():
-    return load_json(USAGE_FILE, {})
-
-def check_and_increment_usage(user_id: int, limit: int) -> tuple[int, bool]:
-    """(count_used, allowed) return karo"""
+def check_and_increment_usage(uid: int, limit: int):
     if limit <= 0:
-        return 0, True  # 0 = unlimited
-    usage = get_usage()
+        return 0, True
+    usage = load_json(USAGE_FILE, {})
     today = str(date.today())
-    uid = str(user_id)
-    if uid not in usage or usage[uid].get("date") != today:
-        usage[uid] = {"date": today, "count": 0}
-    count = usage[uid]["count"]
+    key = str(uid)
+    if key not in usage or usage[key].get("date") != today:
+        usage[key] = {"date": today, "count": 0}
+    count = usage[key]["count"]
     if count >= limit:
         save_json(USAGE_FILE, usage)
         return count, False
-    usage[uid]["count"] += 1
+    usage[key]["count"] += 1
     save_json(USAGE_FILE, usage)
-    return usage[uid]["count"], True
+    return usage[key]["count"], True
 
 # ════════════════════════════════════════════════════════════
 #  SUBSCRIBE CHECK
 # ════════════════════════════════════════════════════════════
 
-async def is_subscribed(user_id, context):
+async def is_subscribed(uid, context):
     if not FORCE_SUB_CHANNEL:
         return True
     try:
-        member = await context.bot.get_chat_member(FORCE_SUB_CHANNEL, user_id)
-        return member.status not in ("left", "kicked")
+        m = await context.bot.get_chat_member(FORCE_SUB_CHANNEL, uid)
+        return m.status not in ("left", "kicked")
     except Exception:
         return False
 
@@ -202,43 +178,36 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🚫 Tum banned ho. Admin se contact karo.")
         return
 
-    args = context.args
-
     if not await is_subscribed(user.id, context):
-        keyboard = [[InlineKeyboardButton("📢 Channel Join Karo",
-            url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")]]
+        kb = [[InlineKeyboardButton("📢 Channel Join Karo", url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")]]
         await update.message.reply_text(
             f"⚠️ *{user.first_name}*, pehle channel join karo!\n\nJoin ke baad dobara /start bhejo.",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
         return
 
+    args = context.args
     if args and args[0].startswith("file_"):
         await send_file(update, context, args[0])
         return
 
     settings = get_settings()
-    msg_text = settings["start_msg"].replace("{name}", user.first_name)
-
-    keyboard = []
+    text = settings["start_msg"].replace("{name}", user.first_name)
+    kb = []
     if FORCE_SUB_CHANNEL:
-        keyboard.append([InlineKeyboardButton("📢 Hamara Channel",
-            url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")])
-
-    await update.message.reply_text(msg_text, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
+        kb.append([InlineKeyboardButton("📢 Hamara Channel", url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")])
+    await update.message.reply_text(text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(kb) if kb else None)
 
 # ════════════════════════════════════════════════════════════
-#  SEND FILE — with daily limit + secure token + auto delete
+#  SEND FILE
 # ════════════════════════════════════════════════════════════
 
 async def send_file(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str):
     user = update.effective_user
-
     if is_banned(user.id):
         await update.message.reply_text("🚫 Tum banned ho.")
         return
 
-    # Token verify karo
     msg_id, valid = parse_file_arg(arg)
     if not valid or msg_id is None:
         await update.message.reply_text("❌ Invalid ya expired link hai.")
@@ -246,35 +215,25 @@ async def send_file(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str
 
     settings = get_settings()
 
-    # Daily limit check (admins exempt)
     if not is_admin(user.id):
         limit = settings.get("daily_limit", 5)
         count, allowed = check_and_increment_usage(user.id, limit)
         if not allowed:
             await update.message.reply_text(
-                f"⚠️ *Daily limit reach ho gayi!*\n\n"
-                f"Tum aaj `{limit}` videos download kar chuke ho.\n"
-                f"Kal dobara aao! 🙏",
-                parse_mode="Markdown"
-            )
+                f"⚠️ *Daily limit reach ho gayi!*\n\nTum aaj `{limit}` videos download kar chuke ho.\nKal dobara aao! 🙏",
+                parse_mode="Markdown")
             return
 
     try:
-        # Final channel se forward karo (thumbnail changed videos yahan hain)
         from_ch = FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else DB_CHANNEL_ID
         sent_msg = await context.bot.forward_message(
             chat_id=update.effective_chat.id,
             from_chat_id=from_ch,
             message_id=msg_id
         )
-        logger.info(f"File {msg_id} forward kari user {user.id} ko")
 
-        # Auto delete schedule karo
         delete_after = settings.get("auto_delete_seconds", 0)
         if delete_after and delete_after > 0:
-            after_msg = settings.get("after_delete_msg", "⏰ File delete ho gayi.")
-
-            # Time display
             if delete_after >= 3600:
                 time_str = f"{delete_after // 3600} ghante"
             elif delete_after >= 60:
@@ -282,39 +241,27 @@ async def send_file(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str
             else:
                 time_str = f"{delete_after} second"
 
-            del_msg_text = settings.get("delete_msg", "🗑 Yeh file {time} baad delete ho jayegi.")
-            notice = await update.message.reply_text(
-                del_msg_text.replace("{time}", time_str)
-            )
+            del_notice = settings.get("delete_msg", "🗑 Yeh file {time} baad delete ho jayegi.")
+            notice = await update.message.reply_text(del_notice.replace("{time}", time_str))
 
             async def auto_delete():
                 await asyncio.sleep(delete_after)
+                for mid in [sent_msg.message_id, notice.message_id]:
+                    try:
+                        await context.bot.delete_message(chat_id=update.effective_chat.id, message_id=mid)
+                    except Exception:
+                        pass
+                after_msg = settings.get("after_delete_msg", "⏰ File delete ho gayi.")
                 try:
-                    await context.bot.delete_message(
-                        chat_id=update.effective_chat.id,
-                        message_id=sent_msg.message_id
-                    )
-                except Exception:
-                    pass
-                try:
-                    await context.bot.delete_message(
-                        chat_id=update.effective_chat.id,
-                        message_id=notice.message_id
-                    )
-                except Exception:
-                    pass
-                try:
-                    await context.bot.send_message(
-                        chat_id=update.effective_chat.id,
-                        text=after_msg
-                    )
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=after_msg)
                 except Exception:
                     pass
 
             asyncio.create_task(auto_delete())
 
+        logger.info(f"File {msg_id} bheji user {user.id}")
     except Exception as e:
-        logger.error(f"Forward fail: {type(e).__name__}: {e}")
+        logger.error(f"Forward fail: {e}")
         await update.message.reply_text("❌ File nahi mili. Link expire ho gaya hoga.")
 
 # ════════════════════════════════════════════════════════════
@@ -333,26 +280,20 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     if not await is_subscribed(user.id, context):
-        keyboard = [[InlineKeyboardButton("📢 Channel Join Karo",
-            url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")]]
-        await msg.reply_text("⚠️ Pehle channel join karo!",
-            reply_markup=InlineKeyboardMarkup(keyboard))
+        kb = [[InlineKeyboardButton("📢 Channel Join Karo", url=f"https://t.me/{FORCE_SUB_CHANNEL.lstrip('@')}")]]
+        await msg.reply_text("⚠️ Pehle channel join karo!", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     text_content = msg.text or msg.caption or ""
     urls = URL_PATTERN.findall(text_content)
 
     if not urls:
-        await msg.reply_text(
-            "🔗 Koi valid link nahi mila!\n\nMujhe koi URL bhejo.",
-            parse_mode="Markdown")
+        await msg.reply_text("🔗 Koi valid link nahi mila!\n\nMujhe koi URL bhejo.", parse_mode="Markdown")
         return
 
     link_to_process = urls[0]
     processing_msg = await msg.reply_text(
-        "⏳ *Link process ho raha hai...*\n\n"
-        f"🔗 `{link_to_process}`\n\n"
-        "Thodi der mein video ka link milega. Ruko! 🙏",
+        f"⏳ *Link process ho raha hai...*\n\n🔗 `{link_to_process}`\n\nThodi der mein video ka link milega. Ruko! 🙏",
         parse_mode="Markdown")
 
     context.bot_data[f"pending_{user.id}"] = {
@@ -366,23 +307,28 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             target_entity = await telethon_client.get_entity(TARGET_BOT)
         except Exception:
             target_entity = TARGET_BOT
-
         sent = await telethon_client.send_message(target_entity, link_to_process)
         logger.info(f"✅ Link bheja {TARGET_BOT} | msg_id={sent.id} | user={user.id}")
-
     except Exception as e:
-        logger.error(f"Telethon send error: {type(e).__name__}: {e}")
-        await processing_msg.edit_text(
-            f"❌ Link bhejne mein error aaya.\nError: `{type(e).__name__}`\n\nDobara try karo.",
-            parse_mode="Markdown")
+        logger.error(f"Telethon send error: {e}")
+        await processing_msg.edit_text(f"❌ Link bhejne mein error.\nError: `{type(e).__name__}`\n\nDobara try karo.", parse_mode="Markdown")
 
 # ════════════════════════════════════════════════════════════
-#  CHANNEL POST
+#  CHANNEL 1 POST — BookTherapyBot ne video upload ki
 # ════════════════════════════════════════════════════════════
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.channel_post
     if not msg:
+        return
+
+    # Sirf Channel 1 ke posts
+    if int(msg.chat_id) != int(DB_CHANNEL_ID):
+        return
+
+    # Humara khud ka processed message ignore karo
+    if msg.message_id in processed_msg_ids:
+        processed_msg_ids.discard(msg.message_id)
         return
 
     has_media = any([msg.video, msg.document, msg.audio,
@@ -392,8 +338,9 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     try:
         file_ref = msg.message_id
+        caption = msg.caption or ""
 
-        # Video hai to pehle ThumbBot ko bhejo thumbnail change ke liye
+        # Video hai to ThumbBot ko bhejo
         if msg.video:
             try:
                 tg_msg = await telethon_client.get_messages(msg.chat_id, ids=file_ref)
@@ -401,99 +348,94 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
                     sent = await telethon_client.send_file(
                         THUMB_BOT,
                         file=tg_msg.media,
-                        caption=tg_msg.message or ""
+                        caption=caption
                     )
-                    # Is message ka response track karo
                     thumb_pending[sent.id] = {
-                        "chat_id": msg.chat_id,
-                        "original_msg_id": file_ref,
-                        "caption": tg_msg.message or ""
+                        "caption": caption,
+                        "bot_data": context.bot_data
                     }
-                    logger.info(f"Video {file_ref} ThumbBot ko bheja, tracking sent_id={sent.id}")
-                    return  # ThumbBot response aane pe aage process hoga
+                    logger.info(f"Video {file_ref} ThumbBot ko bheja, tracking id={sent.id}")
+                    return
             except Exception as e:
                 logger.warning(f"ThumbBot send fail, direct link banata hu: {e}")
 
-        # Video nahi ya ThumbBot fail — seedha link banao
-        file_arg = make_file_arg(file_ref)
-        link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
-
-        # Media details
-        if msg.video:
-            media_type = "🎬 Video"
-            size_mb = round(msg.video.file_size / 1024 / 1024, 1) if msg.video.file_size else "?"
-            dur = msg.video.duration or 0
-            details = f"📐 Size: {size_mb} MB  |  ⏱ {dur // 60}:{dur % 60:02d}"
-        elif msg.document:
-            media_type = "📄 Document"
-            size_mb = round(msg.document.file_size / 1024 / 1024, 1) if msg.document.file_size else "?"
-            details = f"📐 Size: {size_mb} MB"
-        elif msg.audio:
-            media_type = "🎵 Audio"
-            details = f"🎤 {msg.audio.title or 'Unknown'}"
-        elif msg.photo:
-            media_type = "🖼 Photo"
-            details = "High quality image"
-        else:
-            media_type = "📁 File"
-            details = ""
-
-        caption = msg.caption or ""
-        title_line = f"*{caption[:60]}*\n" if caption else ""
-
-        channel_text = (
-            f"{media_type} Available!\n\n"
-            f"{title_line}{details}\n\n"
-            f"🔗 *Download Link:*\n`{link}`"
-        )
-        keyboard = [[InlineKeyboardButton("📥 Get File", url=link)]]
-
-        await context.bot.send_message(
-            chat_id=msg.chat_id, text=channel_text,
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-
-        # Pending users notify karo
-        notified = []
-        for key, data in list(context.bot_data.items()):
-            if not str(key).startswith("pending_"):
-                continue
-            uid = int(str(key).replace("pending_", ""))
-            try:
-                await context.bot.send_message(
-                    chat_id=data["chat_id"],
-                    text=(
-                        f"✅ *Video ready hai!*\n\n"
-                        f"{title_line}{details}\n\n"
-                        f"🔗 *Tumhara Download Link:*\n`{link}`"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[
-                        InlineKeyboardButton("📥 Video Download Karo", url=link)
-                    ]])
-                )
-                try:
-                    await context.bot.delete_message(chat_id=data["chat_id"], message_id=data["msg_id"])
-                except Exception:
-                    pass
-                notified.append(key)
-            except Exception as e:
-                logger.error(f"Notify error user {uid}: {e}")
-
-        for k in notified:
-            context.bot_data.pop(k, None)
-
-        logger.info(f"Channel link bana: {link}")
+        # ThumbBot fail ya video nahi — seedha Final Channel pe bhejo ya link banao
+        await process_final_video(msg.chat_id, file_ref, caption, context.bot_data)
 
     except Exception as e:
         logger.error(f"Channel post error: {e}")
+
+# ════════════════════════════════════════════════════════════
+#  FINAL VIDEO PROCESS — link banao aur user ko do
+# ════════════════════════════════════════════════════════════
+
+async def process_final_video(source_chat_id, file_ref, caption, bot_data):
+    app = application_ref[0]
+
+    # Agar FINAL_CHANNEL_ID set hai to wahan forward karo
+    if FINAL_CHANNEL_ID and int(source_chat_id) != int(FINAL_CHANNEL_ID):
+        try:
+            fwd = await app.bot.forward_message(
+                chat_id=FINAL_CHANNEL_ID,
+                from_chat_id=source_chat_id,
+                message_id=file_ref
+            )
+            file_ref = fwd.message_id
+            processed_msg_ids.add(file_ref)
+            final_chat = FINAL_CHANNEL_ID
+        except Exception as e:
+            logger.error(f"Final channel forward error: {e}")
+            final_chat = source_chat_id
+    else:
+        final_chat = source_chat_id
+
+    file_arg = make_file_arg(file_ref)
+    link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
+    logger.info(f"Link bana: {link}")
+
+    # Channel pe link message bhejo
+    try:
+        kb = [[InlineKeyboardButton("📥 Get File", url=link)]]
+        await app.bot.send_message(
+            chat_id=final_chat,
+            text=f"🎬 *Video Available!*\n\n{caption[:60] + chr(10) if caption else ''}🔗 *Download Link:*\n`{link}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+    except Exception as e:
+        logger.error(f"Channel link msg error: {e}")
+
+    # Pending users ko notify karo
+    notified = []
+    for key, udata in list(bot_data.items()):
+        if not str(key).startswith("pending_"):
+            continue
+        uid = int(str(key).replace("pending_", ""))
+        try:
+            await app.bot.send_message(
+                chat_id=udata["chat_id"],
+                text=f"✅ *Video ready hai!*\n\n🔗 *Download Link:*\n`{link}`",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Video Download Karo", url=link)]])
+            )
+            try:
+                await app.bot.delete_message(chat_id=udata["chat_id"], message_id=udata["msg_id"])
+            except Exception:
+                pass
+            notified.append(key)
+            logger.info(f"User {uid} notify kiya")
+        except Exception as e:
+            logger.error(f"Notify error {uid}: {e}")
+
+    for k in notified:
+        bot_data.pop(k, None)
 
 # ════════════════════════════════════════════════════════════
 #  ADMIN PANEL
 # ════════════════════════════════════════════════════════════
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("🚫 Sirf admins ke liye!")
         return
     await show_admin_panel(update, context)
@@ -503,147 +445,98 @@ async def show_admin_panel(update, context):
     banned = get_banned()
     pending = sum(1 for k in context.bot_data if str(k).startswith("pending_"))
     settings = get_settings()
-    thumb_status = "✅ Set hai" if (os.path.exists(THUMBNAIL_PATH) or os.path.exists(THUMB_FILE_ID_FILE)) else "❌ Nahi"
     limit = settings.get("daily_limit", 5)
     del_sec = settings.get("auto_delete_seconds", 0)
     del_str = f"{del_sec}s" if del_sec else "Off"
+    thumb_status = "✅" if os.path.exists(THUMBNAIL_PATH) or os.path.exists(THUMB_FILE_ID_FILE) else "❌"
 
-    keyboard = [
+    kb = [
         [InlineKeyboardButton("✏️ Start Message", callback_data="admin_setstartmsg"),
          InlineKeyboardButton("🖼 Thumbnail", callback_data="admin_setthumb")],
         [InlineKeyboardButton(f"📥 Daily Limit: {limit}", callback_data="admin_setlimit"),
          InlineKeyboardButton(f"⏱ Auto Delete: {del_str}", callback_data="admin_setdelete")],
-        [InlineKeyboardButton("🗑 Delete Notice Msg", callback_data="admin_setdelmsg"),
-         InlineKeyboardButton("📩 After Delete Msg", callback_data="admin_setafterdelmsg")],
+        [InlineKeyboardButton("🗑 Delete Notice", callback_data="admin_setdelmsg"),
+         InlineKeyboardButton("📩 After Delete", callback_data="admin_setafterdelmsg")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
          InlineKeyboardButton("👥 Users List", callback_data="admin_users")],
         [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
          InlineKeyboardButton("✅ Unban User", callback_data="admin_unban")],
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
     ]
-
     text = (
         "🛠 *Admin Panel*\n\n"
-        f"👥 Total Users: `{len(users)}`\n"
+        f"👥 Users: `{len(users)}`\n"
         f"🚫 Banned: `{len(banned)}`\n"
         f"⏳ Pending: `{pending}`\n"
         f"🖼 Thumbnail: {thumb_status}\n"
         f"📥 Daily Limit: `{limit}` videos\n"
-        f"⏱ Auto Delete: `{del_str}`\n\n"
-        "Option chuno:"
+        f"⏱ Auto Delete: `{del_str}`"
     )
-
-    msg = update.message or (update.callback_query.message if update.callback_query else None)
     if update.callback_query:
-        await update.callback_query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard))
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
     else:
-        await msg.reply_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(keyboard))
-
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    user = query.from_user
     await query.answer()
-
-    if not is_admin(user.id):
+    if not is_admin(query.from_user.id):
         await query.edit_message_text("🚫 Sirf admins ke liye!")
         return
 
     data = query.data
+    settings = get_settings()
+    back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]])
 
     if data == "admin_back":
         await show_admin_panel(update, context)
-
     elif data == "admin_stats":
         users = get_all_users()
         banned = get_banned()
         pending = sum(1 for k in context.bot_data if str(k).startswith("pending_"))
         await query.edit_message_text(
-            f"📊 *Stats*\n\n👥 Users: `{len(users)}`\n🚫 Banned: `{len(banned)}`\n⏳ Pending: `{pending}`\n🖼 Thumb: {'✅' if os.path.exists(THUMBNAIL_PATH) else '❌'}",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
-
+            f"📊 *Stats*\n\n👥 Users: `{len(users)}`\n🚫 Banned: `{len(banned)}`\n⏳ Pending: `{pending}`",
+            parse_mode="Markdown", reply_markup=back_kb)
     elif data == "admin_users":
         users = get_all_users()
         banned = get_banned()
-        text = "👥 *Users List:*\n\n"
+        text = "👥 *Users:*\n\n"
         for uid, name in list(users.items())[:30]:
             mark = " 🚫" if int(uid) in banned else ""
             text += f"• {name}{mark} (`{uid}`)\n"
         if len(users) > 30:
-            text += f"\n...aur {len(users)-30} users"
-        await query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
-
+            text += f"\n...aur {len(users)-30} more"
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=back_kb)
     elif data == "admin_setstartmsg":
         context.user_data["admin_action"] = "set_start_msg"
-        await query.edit_message_text(
-            "✏️ *Start Message Set Karo*\n\n`{name}` likhne pe user ka naam aayega.\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text("✏️ *Start Message Set Karo*\n\n`{name}` likhne pe user ka naam aayega.\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_setthumb":
         context.user_data["admin_action"] = "set_thumb"
-        await query.edit_message_text(
-            "🖼 *Thumbnail Set Karo*\n\nEk photo bhejo — woh thumbnail ban jayega.\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text("🖼 *Thumbnail Set Karo*\n\nPhoto bhejo.\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_setlimit":
         context.user_data["admin_action"] = "set_limit"
-        settings = get_settings()
-        await query.edit_message_text(
-            f"📥 *Daily Download Limit Set Karo*\n\nAbhi: `{settings.get('daily_limit', 5)}`\n\n"
-            "Number bhejo (jaise `5`).\n`0` likhne pe unlimited ho jayega.\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text(f"📥 *Daily Limit*\n\nAbhi: `{settings.get('daily_limit', 5)}`\n\nNumber bhejo (`0` = unlimited).\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_setdelete":
         context.user_data["admin_action"] = "set_delete"
-        settings = get_settings()
-        await query.edit_message_text(
-            f"⏱ *Auto Delete Time Set Karo*\n\nAbhi: `{settings.get('auto_delete_seconds', 0)}` seconds\n\n"
-            "Seconds mein number bhejo:\n"
-            "• `300` = 5 minute\n• `3600` = 1 ghanta\n• `0` = auto delete off\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text(f"⏱ *Auto Delete*\n\nAbhi: `{settings.get('auto_delete_seconds', 0)}s`\n\nSeconds mein (`0` = off).\n• 300 = 5 min\n• 3600 = 1 ghanta\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_setdelmsg":
         context.user_data["admin_action"] = "set_del_msg"
-        settings = get_settings()
-        await query.edit_message_text(
-            f"🗑 *Delete Notice Message Set Karo*\n\nJab file bhejo tab yeh message aata hai.\n"
-            f"`{{time}}` likhne pe time aayega.\n\nAbhi:\n`{settings.get('delete_msg', '')}`\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text(f"🗑 *Delete Notice*\n\n`{{time}}` se time aayega.\n\nAbhi:\n`{settings.get('delete_msg', '')}`\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_setafterdelmsg":
         context.user_data["admin_action"] = "set_after_del_msg"
-        settings = get_settings()
-        await query.edit_message_text(
-            f"📩 *After Delete Message Set Karo*\n\nFile delete hone ke baad yeh message aayega.\n\n"
-            f"Abhi:\n`{settings.get('after_delete_msg', '')}`\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text(f"📩 *After Delete Message*\n\nAbhi:\n`{settings.get('after_delete_msg', '')}`\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_broadcast":
         context.user_data["admin_action"] = "broadcast"
-        await query.edit_message_text(
-            "📢 *Broadcast Message*\n\nMessage bhejo (text/photo/video).\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text("📢 *Broadcast*\n\nMessage bhejo (text/photo/video).\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_ban":
         context.user_data["admin_action"] = "ban"
-        await query.edit_message_text(
-            "🚫 *Ban User*\n\nUser ka ID bhejo.\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text("🚫 *Ban User*\n\nUser ID bhejo.\n\n/cancel se wapas.", parse_mode="Markdown")
     elif data == "admin_unban":
         context.user_data["admin_action"] = "unban"
-        await query.edit_message_text(
-            "✅ *Unban User*\n\nUser ka ID bhejo.\n\n/cancel se wapas jao.",
-            parse_mode="Markdown")
-
+        await query.edit_message_text("✅ *Unban User*\n\nUser ID bhejo.\n\n/cancel se wapas.", parse_mode="Markdown")
 
 async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
     if not is_admin(user.id):
         await handle_user_message(update, context)
         return
@@ -661,22 +554,19 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             settings["start_msg"] = msg.text
             save_settings(settings)
             context.user_data.pop("admin_action", None)
-            await msg.reply_text("✅ Start message update ho gaya!", parse_mode="Markdown")
+            await msg.reply_text("✅ Start message update ho gaya!")
         else:
             await msg.reply_text("⚠️ Sirf text bhejo!")
 
     elif action == "set_thumb":
         if msg.photo:
             photo = msg.photo[-1]
-            # File ID save karo (permanent)
             with open(THUMB_FILE_ID_FILE, "w") as f:
                 f.write(photo.file_id)
-            # Download bhi karo (Telethon ke liye)
             file = await context.bot.get_file(photo.file_id)
             await file.download_to_drive(THUMBNAIL_PATH)
             context.user_data.pop("admin_action", None)
-            await msg.reply_text("✅ *Thumbnail save ho gaya!*\nAb se naye videos pe yahi thumbnail lagega.", parse_mode="Markdown")
-            logger.info(f"Thumbnail saved: {photo.file_id}")
+            await msg.reply_text("✅ *Thumbnail save ho gaya!*", parse_mode="Markdown")
         else:
             await msg.reply_text("⚠️ Photo bhejo!")
 
@@ -686,9 +576,9 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             save_settings(settings)
             context.user_data.pop("admin_action", None)
             lim = settings["daily_limit"]
-            await msg.reply_text(f"✅ Daily limit set: `{'Unlimited' if lim == 0 else lim}`", parse_mode="Markdown")
+            await msg.reply_text(f"✅ Daily limit: `{'Unlimited' if lim == 0 else lim}`", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ Sirf number bhejo!")
+            await msg.reply_text("⚠️ Number bhejo!")
 
     elif action == "set_delete":
         if msg.text and msg.text.strip().isdigit():
@@ -696,16 +586,16 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             save_settings(settings)
             context.user_data.pop("admin_action", None)
             sec = settings["auto_delete_seconds"]
-            await msg.reply_text(f"✅ Auto delete: `{'Off' if sec == 0 else f'{sec} seconds'}`", parse_mode="Markdown")
+            await msg.reply_text(f"✅ Auto delete: `{'Off' if sec == 0 else str(sec) + ' seconds'}`", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ Sirf number (seconds) bhejo!")
+            await msg.reply_text("⚠️ Seconds mein number bhejo!")
 
     elif action == "set_del_msg":
         if msg.text:
             settings["delete_msg"] = msg.text
             save_settings(settings)
             context.user_data.pop("admin_action", None)
-            await msg.reply_text("✅ Delete notice message set ho gaya!")
+            await msg.reply_text("✅ Delete notice set ho gaya!")
         else:
             await msg.reply_text("⚠️ Text bhejo!")
 
@@ -729,11 +619,9 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 continue
             try:
                 if msg.photo:
-                    await context.bot.send_photo(chat_id=uid, photo=msg.photo[-1].file_id,
-                        caption=msg.caption or "", parse_mode="Markdown")
+                    await context.bot.send_photo(chat_id=uid, photo=msg.photo[-1].file_id, caption=msg.caption or "", parse_mode="Markdown")
                 elif msg.video:
-                    await context.bot.send_video(chat_id=uid, video=msg.video.file_id,
-                        caption=msg.caption or "", parse_mode="Markdown")
+                    await context.bot.send_video(chat_id=uid, video=msg.video.file_id, caption=msg.caption or "", parse_mode="Markdown")
                 elif msg.text:
                     await context.bot.send_message(chat_id=uid, text=msg.text, parse_mode="Markdown")
                 sent += 1
@@ -744,22 +632,19 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     elif action == "ban":
         if msg.text and msg.text.strip().isdigit():
-            uid = int(msg.text.strip())
-            ban_user(uid)
+            ban_user(int(msg.text.strip()))
             context.user_data.pop("admin_action", None)
-            await msg.reply_text(f"🚫 User `{uid}` ban!", parse_mode="Markdown")
+            await msg.reply_text(f"🚫 User `{msg.text.strip()}` ban!", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ User ID (number) bhejo!")
+            await msg.reply_text("⚠️ User ID bhejo!")
 
     elif action == "unban":
         if msg.text and msg.text.strip().isdigit():
-            uid = int(msg.text.strip())
-            unban_user(uid)
+            unban_user(int(msg.text.strip()))
             context.user_data.pop("admin_action", None)
-            await msg.reply_text(f"✅ User `{uid}` unban!", parse_mode="Markdown")
+            await msg.reply_text(f"✅ User `{msg.text.strip()}` unban!", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ User ID (number) bhejo!")
-
+            await msg.reply_text("⚠️ User ID bhejo!")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("admin_action", None)
@@ -772,14 +657,14 @@ async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: `/ban USER_ID`", parse_mode="Markdown"); return
     ban_user(int(context.args[0]))
-    await update.message.reply_text(f"🚫 User `{context.args[0]}` ban!", parse_mode="Markdown")
+    await update.message.reply_text(f"🚫 `{context.args[0]}` ban!", parse_mode="Markdown")
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id): return
     if not context.args:
         await update.message.reply_text("Usage: `/unban USER_ID`", parse_mode="Markdown"); return
     unban_user(int(context.args[0]))
-    await update.message.reply_text(f"✅ User `{context.args[0]}` unban!", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ `{context.args[0]}` unban!", parse_mode="Markdown")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -803,108 +688,26 @@ async def run():
     me = await telethon_client.get_me()
     logger.info(f"Telethon: {me.first_name} (@{me.username})")
 
-    # ThumbBot ka response sunna — woh same chat mein video bhejta hai
-    from telethon import events
-
+    # ThumbBot response handler
     @telethon_client.on(events.NewMessage(chats=THUMB_BOT))
     async def on_thumb_response(event):
         msg = event.message
         if not msg.media:
             return
-
-        logger.info(f"ThumbBot se response aaya: msg_id={msg.id}")
-
-        # Koi bhi pending thumbnail request ke liye process karo
+        logger.info(f"ThumbBot response: msg_id={msg.id}")
         if not thumb_pending:
             return
-
-        # Pehli pending request lo (FIFO)
         pending_key = next(iter(thumb_pending))
         data = thumb_pending.pop(pending_key)
-
-        try:
-            # Thumbnail changed video ko Channel 2 pe upload karo
-            target_ch = FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else data["chat_id"]
-            forwarded = await telethon_client.send_file(
-                target_ch,
-                file=msg.media,
-                caption=data["caption"],
-                supports_streaming=True
-            )
-            file_ref = forwarded.id
-            processed_msg_ids.add(file_ref)
-
-            file_arg = make_file_arg(file_ref)
-            link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
-            logger.info(f"✅ Thumbnail changed video Channel 2 pe: {link}")
-
-            # Pending users notify karo
-            ptb_app = application_ref[0]
-            notified = []
-            for key, udata in list(ptb_app.bot_data.items()):
-                if not str(key).startswith("pending_"):
-                    continue
-                uid = int(str(key).replace("pending_", ""))
-                try:
-                    await ptb_app.bot.send_message(
-                        chat_id=udata["chat_id"],
-                        text=(
-                            f"✅ *Video ready hai!*
-
-"
-                            f"🔗 *Download Link:*
-`{link}`"
-                        ),
-                        parse_mode="Markdown",
-                        reply_markup=InlineKeyboardMarkup([[
-                            InlineKeyboardButton("📥 Video Download Karo", url=link)
-                        ]])
-                    )
-                    try:
-                        await ptb_app.bot.delete_message(
-                            chat_id=udata["chat_id"],
-                            message_id=udata["msg_id"]
-                        )
-                    except Exception:
-                        pass
-                    notified.append(key)
-                except Exception as e:
-                    logger.error(f"Notify error {uid}: {e}")
-            for k in notified:
-                ptb_app.bot_data.pop(k, None)
-
-            # Channel pe link message bhi bhejo
-            if msg.video:
-                dur = getattr(msg.video, 'duration', 0) or 0
-                size_mb = round(msg.document.size / 1024 / 1024, 1) if hasattr(msg, 'document') and msg.document else "?"
-                details = f"⏱ {dur // 60}:{dur % 60:02d}"
-            else:
-                details = ""
-
-            final_ch = FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else data["chat_id"]
-            await ptb_app.bot.send_message(
-                chat_id=final_ch,
-                text=(
-                    f"🎬 Video Available!
-
-"
-                    f"{details}
-
-"
-                    f"🔗 *Download Link:*
-`{link}`"
-                ),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📥 Get File", url=link)
-                ]])
-            )
-
-        except Exception as e:
-            logger.error(f"ThumbBot response process error: {e}")
+        await process_final_video(
+            FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else DB_CHANNEL_ID,
+            msg.id,
+            data["caption"],
+            data["bot_data"]
+        )
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    application_ref = [app]  # Telethon handler mein access ke liye
+    application_ref.append(app)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
