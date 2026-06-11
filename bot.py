@@ -17,8 +17,8 @@ from telethon.sessions import StringSession
 #  CONFIG
 # ============================================================
 BOT_TOKEN         = os.environ.get("BOT_TOKEN", "")
-DB_CHANNEL_ID     = int(os.environ.get("DB_CHANNEL_ID", "0"))
-FINAL_CHANNEL_ID  = int(os.environ.get("FINAL_CHANNEL_ID", "0"))
+DB_CHANNEL_ID     = int(os.environ.get("DB_CHANNEL_ID", "0"))      # Channel 1 — BookTherapyBot yahan upload karta hai
+FINAL_CHANNEL_ID  = int(os.environ.get("FINAL_CHANNEL_ID", "0"))   # Channel 2 — thumbnail changed video yahan
 FORCE_SUB_CHANNEL = os.environ.get("FORCE_SUB_CHANNEL", "")
 BOT_USERNAME      = os.environ.get("BOT_USERNAME", "")
 WEBHOOK_URL       = os.environ.get("WEBHOOK_URL", "")
@@ -29,13 +29,13 @@ SESSION_STRING    = os.environ.get("SESSION_STRING", "")
 ADMIN_IDS         = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 SECRET_KEY        = os.environ.get("SECRET_KEY", BOT_TOKEN[:20])
 TARGET_BOT        = "BookTherepybot"
-THUMB_BOT         = "VideosThumb_hgbot"
+THUMB_BOT         = "Daddyrenamle11bot"  # Thumbnail change karta hai aur Channel 2 pe bhejta hai
 
-SETTINGS_FILE      = "settings.json"
-BANNED_FILE        = "banned.json"
-USERS_FILE         = "users.json"
-USAGE_FILE         = "usage.json"
-THUMBNAIL_PATH     = "/tmp/thumb.jpg"
+SETTINGS_FILE  = "settings.json"
+BANNED_FILE    = "banned.json"
+USERS_FILE     = "users.json"
+USAGE_FILE     = "usage.json"
+THUMBNAIL_PATH = "/tmp/thumb.jpg"
 THUMB_FILE_ID_FILE = "/tmp/thumb_file_id.txt"
 # ============================================================
 
@@ -49,9 +49,8 @@ application_ref = []
 # Processed IDs — loop rokne ke liye
 processed_msg_ids: set = set()
 
-# ThumbBot pending queue
-# KEY = caption string (same caption se match karenge ThumbBot response se)
-# VALUE = { "caption": ..., "bot_data": ... }
+# ThumbBot se response ka wait
+# {sent_msg_id: {chat_id, caption, user_pending_key}}
 thumb_pending: dict = {}
 
 # ════════════════════════════════════════════════════════════
@@ -312,14 +311,10 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info(f"✅ Link bheja {TARGET_BOT} | msg_id={sent.id} | user={user.id}")
     except Exception as e:
         logger.error(f"Telethon send error: {e}")
-        await processing_msg.edit_text(
-            f"❌ Link bhejne mein error.\nError: `{type(e).__name__}`\n\nDobara try karo.",
-            parse_mode="Markdown")
+        await processing_msg.edit_text(f"❌ Link bhejne mein error.\nError: `{type(e).__name__}`\n\nDobara try karo.", parse_mode="Markdown")
 
 # ════════════════════════════════════════════════════════════
 #  CHANNEL 1 POST — BookTherapyBot ne video upload ki
-#  ✅ FIX: Sirf ThumbBot ko bhejo aur RETURN karo
-#         Koi bhi fallback nahi — original video forward nahi hogi
 # ════════════════════════════════════════════════════════════
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,14 +322,9 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not msg:
         return
 
-    # Sirf Channel 1 (DB_CHANNEL_ID) ke posts handle karo
-    if int(msg.chat_id) != int(DB_CHANNEL_ID):
-        return
-
-    # Apna khud processed message ignore karo (loop prevention)
+    # Humara khud ka processed message ignore karo
     if msg.message_id in processed_msg_ids:
         processed_msg_ids.discard(msg.message_id)
-        logger.info(f"Processed msg {msg.message_id} ignore kiya")
         return
 
     has_media = any([msg.video, msg.document, msg.audio,
@@ -342,36 +332,46 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not has_media:
         return
 
-    file_ref = msg.message_id
-    caption = msg.caption or ""
+    try:
+        file_ref = msg.message_id
+        caption = msg.caption or ""
 
-    # ✅ VIDEO hai — ThumbBot ko bhejo, aage kuch nahi
-    if msg.video:
-        try:
-            tg_msg = await telethon_client.get_messages(msg.chat_id, ids=file_ref)
-            if tg_msg and tg_msg.media:
-                sent = await telethon_client.send_file(
-                    THUMB_BOT,
-                    file=tg_msg.media,
-                    caption=caption
-                )
-                # ✅ Caption ko KEY banao — ThumbBot same caption ke saath processed video bhejega
-                thumb_pending[caption] = {
-                    "caption": caption,
-                    "bot_data": context.bot_data
-                }
-                logger.info(f"✅ Video {file_ref} ThumbBot ko bheja | caption key='{caption[:50]}'")
+        # Channel 1 (DB_CHANNEL_ID) — BookTherapyBot ne upload kiya
+        # Video uthao aur Daddyrenamle11bot ko bhejo
+        if int(msg.chat_id) == int(DB_CHANNEL_ID):
+            if msg.video:
+                try:
+                    tg_msg = await telethon_client.get_messages(msg.chat_id, ids=file_ref)
+                    if tg_msg and tg_msg.media:
+                        sent = await telethon_client.send_file(
+                            THUMB_BOT,
+                            file=tg_msg.media,
+                            caption=caption
+                        )
+                        thumb_pending[sent.id] = {
+                            "caption": caption,
+                            "bot_data": context.bot_data
+                        }
+                        logger.info(f"✅ Video {file_ref} Daddyrenamle11bot ko bheja, id={sent.id}")
+                        return
+                except Exception as e:
+                    logger.warning(f"Daddyrenamle11bot send fail: {e}")
+                    # Fallback — seedha link banao Channel 1 se
+                    await process_final_video(msg.chat_id, file_ref, caption, context.bot_data)
             else:
-                logger.warning(f"tg_msg ya media nahi mila msg_id={file_ref}, skip kar raha hu")
-        except Exception as e:
-            logger.error(f"ThumbBot ko bhejne mein error: {e} | skip kar raha hu")
-        # ✅ HAMESHA RETURN — chahe success ho ya fail
-        # Original video kabhi bhi directly forward nahi hogi
-        return
+                # Video nahi (doc/audio etc) — seedha link banao
+                await process_final_video(msg.chat_id, file_ref, caption, context.bot_data)
+            return
 
-    # Video nahi — document/audio/photo etc. directly process karo
-    logger.info(f"Non-video media {file_ref} directly process ho raha hai")
-    await process_final_video(msg.chat_id, file_ref, caption, context.bot_data)
+        # Channel 2 (FINAL_CHANNEL_ID) — Daddyrenamle11bot ne thumbnail changed video upload ki
+        # Seedha link banao aur user ko do
+        if FINAL_CHANNEL_ID and int(msg.chat_id) == int(FINAL_CHANNEL_ID):
+            logger.info(f"Channel 2 pe naya video: {file_ref}")
+            await process_final_video(msg.chat_id, file_ref, caption, context.bot_data)
+            return
+
+    except Exception as e:
+        logger.error(f"Channel post error: {e}")
 
 # ════════════════════════════════════════════════════════════
 #  FINAL VIDEO PROCESS — link banao aur user ko do
@@ -379,24 +379,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def process_final_video(source_chat_id, file_ref, caption, bot_data):
     app = application_ref[0]
-
-    # Agar FINAL_CHANNEL_ID set hai to wahan forward karo
-    if FINAL_CHANNEL_ID and int(source_chat_id) != int(FINAL_CHANNEL_ID):
-        try:
-            fwd = await app.bot.forward_message(
-                chat_id=FINAL_CHANNEL_ID,
-                from_chat_id=source_chat_id,
-                message_id=file_ref
-            )
-            file_ref = fwd.message_id
-            processed_msg_ids.add(file_ref)
-            final_chat = FINAL_CHANNEL_ID
-            logger.info(f"Final channel pe forward hua: new msg_id={file_ref}")
-        except Exception as e:
-            logger.error(f"Final channel forward error: {e}")
-            final_chat = source_chat_id
-    else:
-        final_chat = source_chat_id
+    final_chat = source_chat_id
 
     file_arg = make_file_arg(file_ref)
     link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
@@ -407,7 +390,7 @@ async def process_final_video(source_chat_id, file_ref, caption, bot_data):
         kb = [[InlineKeyboardButton("📥 Get File", url=link)]]
         await app.bot.send_message(
             chat_id=final_chat,
-            text=f"🎬 Video Available!\n\n🔗 Download Link:\n`{link}`",
+                    text="\U0001f3ac Video Available!\n\n\U0001f517 Download Link:\n`" + link + "`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -425,7 +408,7 @@ async def process_final_video(source_chat_id, file_ref, caption, bot_data):
                 chat_id=udata["chat_id"],
                 text=f"✅ *Video ready hai!*\n\n🔗 *Download Link:*\n`{link}`",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Video Download Karo", url=link)]]) 
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Video Download Karo", url=link)]])
             )
             try:
                 await app.bot.delete_message(chat_id=udata["chat_id"], message_id=udata["msg_id"])
@@ -697,54 +680,33 @@ async def run():
     me = await telethon_client.get_me()
     logger.info(f"Telethon: {me.first_name} (@{me.username})")
 
-    # ════════════════════════════════════════════════════════
-    #  THUMBBOT RESPONSE HANDLER
-    #  ✅ FIX: ThumbBot ki processed video (msg.media) forward karo
-    #          Original video se koi lena dena nahi yahan
-    # ════════════════════════════════════════════════════════
+    # Note: Daddyrenamle11bot seedha FINAL_CHANNEL_ID pe bhejta hai
+    # Isliye handle_channel_post Channel 2 monitor karta hai
+    # Yeh handler sirf backup ke liye hai agar bot direct chat mein de
     @telethon_client.on(events.NewMessage(chats=THUMB_BOT))
     async def on_thumb_response(event):
         msg = event.message
-
-        # Sirf media wale messages process karo
         if not msg.media:
-            logger.info("ThumbBot se text message aaya, ignore kar raha hu")
             return
-
-        logger.info(f"✅ ThumbBot se processed video aayi | msg_id={msg.id}")
-
+        logger.info(f"ThumbBot response: msg_id={msg.id}")
         if not thumb_pending:
-            logger.warning("thumb_pending empty hai, koi pending entry nahi")
             return
-
-        # ✅ Caption se exact match dhundo
-        incoming_caption = msg.message or ""
-        logger.info(f"ThumbBot caption: '{incoming_caption[:50]}'")
-
-        if incoming_caption in thumb_pending:
-            data = thumb_pending.pop(incoming_caption)
-            logger.info(f"✅ Caption exact match: '{incoming_caption[:50]}'")
-        elif thumb_pending:
-            pending_key = next(iter(thumb_pending))
-            data = thumb_pending.pop(pending_key)
-            logger.warning(f"⚠️ Caption match nahi hua, FIFO fallback: '{pending_key[:50]}'")
-        else:
-            logger.warning("thumb_pending empty, koi match nahi")
-            return
+        pending_key = next(iter(thumb_pending))
+        data = thumb_pending.pop(pending_key)
 
         target_ch = FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else DB_CHANNEL_ID
 
         try:
-            # ✅ ThumbBot ki processed video (msg.media) final channel pe bhejo
+            # ThumbBot ke chat se target channel pe forward karo (Telethon se)
             fwd = await telethon_client.send_file(
                 target_ch,
-                file=msg.media,          # ThumbBot ki thumbnail-changed video
+                file=msg.media,
                 caption=data["caption"],
                 supports_streaming=True
             )
             final_ref = fwd.id
             processed_msg_ids.add(final_ref)
-            logger.info(f"✅ Processed video final channel pe aayi | msg_id={final_ref}")
+            logger.info(f"ThumbBot video channel pe: msg_id={final_ref}")
 
             file_arg = make_file_arg(final_ref)
             link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
@@ -753,18 +715,19 @@ async def run():
             app = application_ref[0]
             kb = [[InlineKeyboardButton("📥 Get File", url=link)]]
 
-            # Final channel pe link message bhejo
+            # Channel pe link message
             try:
                 await app.bot.send_message(
                     chat_id=target_ch,
-                    text=f"🎬 Video Available!\n\n🔗 Download Link:\n`{link}`",
+                    text="\U0001f3ac Video Available!\n\n\U0001f517 Download Link:\n`" + link + "`",
+
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(kb)
                 )
             except Exception as e:
                 logger.error(f"Channel link msg error: {e}")
 
-            # Pending users ko notify karo
+            # Pending users notify karo
             bot_data = data["bot_data"]
             notified = []
             for key, udata in list(bot_data.items()):
@@ -774,7 +737,7 @@ async def run():
                 try:
                     await app.bot.send_message(
                         chat_id=udata["chat_id"],
-                        text=f"✅ *Video ready hai!*\n\n🔗 *Download Link:*\n`{link}`",
+                        text="\u2705 *Video ready hai!*\n\n\U0001f517 *Download Link:*\n`" + link + "`",
                         parse_mode="Markdown",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Video Download Karo", url=link)]])
                     )
@@ -786,7 +749,6 @@ async def run():
                     logger.info(f"User {uid} notify kiya")
                 except Exception as e:
                     logger.error(f"Notify error {uid}: {e}")
-
             for k in notified:
                 bot_data.pop(k, None)
 
