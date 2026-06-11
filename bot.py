@@ -3,16 +3,18 @@ import os
 import asyncio
 import re
 import json
+import time
+import hashlib
+import hmac
+from datetime import datetime, date
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
-    filters, ContextTypes, ConversationHandler
+    filters, ContextTypes, CallbackQueryHandler
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import ForwardMessagesRequest
-from telethon.tl.types import InputChannel
 
 # ============================================================
 #  CONFIG
@@ -29,10 +31,13 @@ SESSION_STRING    = os.environ.get("SESSION_STRING", "")
 ADMIN_IDS         = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 TARGET_BOT        = "BookTherepybot"
 
-# Data files
+# Secret key for secure tokens
+SECRET_KEY        = os.environ.get("SECRET_KEY", BOT_TOKEN[:20])
+
 SETTINGS_FILE  = "settings.json"
 BANNED_FILE    = "banned.json"
 USERS_FILE     = "users.json"
+USAGE_FILE     = "usage.json"
 THUMBNAIL_PATH = "thumb.jpg"
 # ============================================================
 
@@ -42,9 +47,38 @@ logger = logging.getLogger(__name__)
 URL_PATTERN = re.compile(r'https?://[^\s]+')
 telethon_client: TelegramClient = None
 
-# ConversationHandler states
-SET_START_MSG, SET_BROADCAST = range(2)
+# ════════════════════════════════════════════════════════════
+#  SECURE TOKEN — link guessing se bachao
+# ════════════════════════════════════════════════════════════
 
+def make_token(msg_id: int) -> str:
+    """msg_id ke liye ek secure HMAC token banao"""
+    key = SECRET_KEY.encode()
+    msg = str(msg_id).encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()[:12]
+
+def verify_token(msg_id: int, token: str) -> bool:
+    """Token valid hai ya nahi check karo"""
+    return hmac.compare_digest(make_token(msg_id), token)
+
+def make_file_arg(msg_id: int) -> str:
+    """file_MSGID_TOKEN format"""
+    return f"file_{msg_id}_{make_token(msg_id)}"
+
+def parse_file_arg(arg: str):
+    """(msg_id, valid) return karo"""
+    parts = arg.replace("file_", "").split("_")
+    if len(parts) == 2:
+        try:
+            msg_id = int(parts[0])
+            token = parts[1]
+            return msg_id, verify_token(msg_id, token)
+        except Exception:
+            pass
+    elif len(parts) == 1:
+        # Purane links bina token ke — reject karo
+        return None, False
+    return None, False
 
 # ════════════════════════════════════════════════════════════
 #  DATA HELPERS
@@ -53,7 +87,7 @@ SET_START_MSG, SET_BROADCAST = range(2)
 def load_json(path, default):
     try:
         if os.path.exists(path):
-            with open(path, "r") as f:
+            with open(path) as f:
                 return json.load(f)
     except Exception:
         pass
@@ -69,10 +103,14 @@ def get_settings():
             "👋 *Namaste {name}!*\n\n"
             "🤖 Main File Share Bot hu.\n\n"
             "📥 *File Download:* Channel pe upload hone wali har video ka link milega\n\n"
-            "🔗 *Link Process:* Koi bhi link bhejo — main video download karke link dunga\n\n"
+            "🔗 *Link Process:* Koi bhi link bhejo — main video process karke link dunga\n\n"
             "━━━━━━━━━━━━━━━━━\n"
             "👇 Seedha koi link bhejo!"
-        )
+        ),
+        "daily_limit": 5,
+        "auto_delete_seconds": 0,
+        "delete_msg": "🗑 Yeh file {time} baad delete ho jayegi.",
+        "after_delete_msg": "⏰ File delete ho gayi. Dobara download karne ke liye link use karo."
     })
 
 def save_settings(data):
@@ -107,6 +145,26 @@ def get_all_users():
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
+# ── Daily limit tracking ────────────────────────────────────
+def get_usage():
+    return load_json(USAGE_FILE, {})
+
+def check_and_increment_usage(user_id: int, limit: int) -> tuple[int, bool]:
+    """(count_used, allowed) return karo"""
+    if limit <= 0:
+        return 0, True  # 0 = unlimited
+    usage = get_usage()
+    today = str(date.today())
+    uid = str(user_id)
+    if uid not in usage or usage[uid].get("date") != today:
+        usage[uid] = {"date": today, "count": 0}
+    count = usage[uid]["count"]
+    if count >= limit:
+        save_json(USAGE_FILE, usage)
+        return count, False
+    usage[uid]["count"] += 1
+    save_json(USAGE_FILE, usage)
+    return usage[uid]["count"], True
 
 # ════════════════════════════════════════════════════════════
 #  SUBSCRIBE CHECK
@@ -120,7 +178,6 @@ async def is_subscribed(user_id, context):
         return member.status not in ("left", "kicked")
     except Exception:
         return False
-
 
 # ════════════════════════════════════════════════════════════
 #  /start
@@ -159,30 +216,93 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg_text, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None)
 
-
 # ════════════════════════════════════════════════════════════
-#  FILE SEND — Forward nahi, seedha copy
+#  SEND FILE — with daily limit + secure token + auto delete
 # ════════════════════════════════════════════════════════════
 
 async def send_file(update: Update, context: ContextTypes.DEFAULT_TYPE, arg: str):
     user = update.effective_user
+
     if is_banned(user.id):
         await update.message.reply_text("🚫 Tum banned ho.")
         return
 
-    msg_id = int(arg.replace("file_", ""))
+    # Token verify karo
+    msg_id, valid = parse_file_arg(arg)
+    if not valid or msg_id is None:
+        await update.message.reply_text("❌ Invalid ya expired link hai.")
+        return
+
+    settings = get_settings()
+
+    # Daily limit check (admins exempt)
+    if not is_admin(user.id):
+        limit = settings.get("daily_limit", 5)
+        count, allowed = check_and_increment_usage(user.id, limit)
+        if not allowed:
+            await update.message.reply_text(
+                f"⚠️ *Daily limit reach ho gayi!*\n\n"
+                f"Tum aaj `{limit}` videos download kar chuke ho.\n"
+                f"Kal dobara aao! 🙏",
+                parse_mode="Markdown"
+            )
+            return
 
     try:
-        await context.bot.forward_message(
+        sent_msg = await context.bot.forward_message(
             chat_id=update.effective_chat.id,
             from_chat_id=DB_CHANNEL_ID,
             message_id=msg_id
         )
         logger.info(f"File {msg_id} forward kari user {user.id} ko")
+
+        # Auto delete schedule karo
+        delete_after = settings.get("auto_delete_seconds", 0)
+        if delete_after and delete_after > 0:
+            after_msg = settings.get("after_delete_msg", "⏰ File delete ho gayi.")
+
+            # Time display
+            if delete_after >= 3600:
+                time_str = f"{delete_after // 3600} ghante"
+            elif delete_after >= 60:
+                time_str = f"{delete_after // 60} minute"
+            else:
+                time_str = f"{delete_after} second"
+
+            del_msg_text = settings.get("delete_msg", "🗑 Yeh file {time} baad delete ho jayegi.")
+            notice = await update.message.reply_text(
+                del_msg_text.replace("{time}", time_str)
+            )
+
+            async def auto_delete():
+                await asyncio.sleep(delete_after)
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=sent_msg.message_id
+                    )
+                except Exception:
+                    pass
+                try:
+                    await context.bot.delete_message(
+                        chat_id=update.effective_chat.id,
+                        message_id=notice.message_id
+                    )
+                except Exception:
+                    pass
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text=after_msg
+                    )
+                except Exception:
+                    pass
+
+            asyncio.create_task(auto_delete())
+
     except Exception as e:
         logger.error(f"Forward fail: {type(e).__name__}: {e}")
         await update.message.reply_text("❌ File nahi mili. Link expire ho gaya hoga.")
-
 
 # ════════════════════════════════════════════════════════════
 #  USER MESSAGE — link process
@@ -211,7 +331,7 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not urls:
         await msg.reply_text(
-            "🔗 Koi valid link nahi mila!\n\nMujhe koi URL bhejo, jaise:\n`https://www.diskwala.com/app/...`",
+            "🔗 Koi valid link nahi mila!\n\nMujhe koi URL bhejo.",
             parse_mode="Markdown")
         return
 
@@ -229,28 +349,22 @@ async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     }
 
     try:
-        # Entity pehle resolve karo — username ya peer se
         try:
             target_entity = await telethon_client.get_entity(TARGET_BOT)
         except Exception:
-            # Fallback: direct username string
             target_entity = TARGET_BOT
 
         sent = await telethon_client.send_message(target_entity, link_to_process)
-        logger.info(f"✅ Link bheja BookTherapyBot ko | msg_id={sent.id} | user={user.id} | link={link_to_process}")
+        logger.info(f"✅ Link bheja {TARGET_BOT} | msg_id={sent.id} | user={user.id}")
 
     except Exception as e:
         logger.error(f"Telethon send error: {type(e).__name__}: {e}")
         await processing_msg.edit_text(
-            f"❌ Link BookTherapyBot ko bhejne mein error aaya.\n\n"
-            f"Error: `{type(e).__name__}`\n\n"
-            "Kuch der baad dobara try karo.",
-            parse_mode="Markdown"
-        )
-
+            f"❌ Link bhejne mein error aaya.\nError: `{type(e).__name__}`\n\nDobara try karo.",
+            parse_mode="Markdown")
 
 # ════════════════════════════════════════════════════════════
-#  CHANNEL POST — naya video aaya
+#  CHANNEL POST
 # ════════════════════════════════════════════════════════════
 
 async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -270,18 +384,30 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             message_id=msg.message_id
         )
         file_ref = forwarded.message_id
-        link = f"https://t.me/{BOT_USERNAME}?start=file_{file_ref}"
 
-        # Thumbnail lagao agar file hai
+        # Secure link banao
+        file_arg = make_file_arg(file_ref)
+        link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
+
+        # ── Thumbnail set karo Telethon se ──────────────────
         if os.path.exists(THUMBNAIL_PATH) and msg.video:
             try:
                 db_msg = await telethon_client.get_messages(DB_CHANNEL_ID, ids=file_ref)
                 if db_msg and db_msg.media:
-                    await telethon_client.edit_message(
-                        DB_CHANNEL_ID, file_ref,
-                        file=db_msg.media, thumb=THUMBNAIL_PATH
+                    # Naya caption wala message send karo thumb ke saath, purana delete karo
+                    new_msg = await telethon_client.send_file(
+                        DB_CHANNEL_ID,
+                        file=db_msg.media,
+                        caption=db_msg.message or "",
+                        thumb=THUMBNAIL_PATH
                     )
-                    logger.info(f"Thumbnail set: msg {file_ref}")
+                    # Purana forward delete karo
+                    await telethon_client.delete_messages(DB_CHANNEL_ID, [file_ref])
+                    # Naya message ID use karo
+                    file_ref = new_msg.id
+                    file_arg = make_file_arg(file_ref)
+                    link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
+                    logger.info(f"✅ Thumbnail set, new msg_id={file_ref}")
             except Exception as e:
                 logger.warning(f"Thumbnail error: {e}")
 
@@ -319,7 +445,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             chat_id=msg.chat_id, text=channel_text,
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-        # Pending users ko notify karo
+        # Pending users notify karo
         notified = []
         for key, data in list(context.bot_data.items()):
             if not str(key).startswith("pending_"):
@@ -354,7 +480,6 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         logger.error(f"Channel post error: {e}")
 
-
 # ════════════════════════════════════════════════════════════
 #  ADMIN PANEL
 # ════════════════════════════════════════════════════════════
@@ -364,15 +489,25 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user.id):
         await update.message.reply_text("🚫 Sirf admins ke liye!")
         return
+    await show_admin_panel(update, context)
 
+async def show_admin_panel(update, context):
     users = get_all_users()
     banned = get_banned()
     pending = sum(1 for k in context.bot_data if str(k).startswith("pending_"))
-    thumb_status = "✅ Set hai" if os.path.exists(THUMBNAIL_PATH) else "❌ Set nahi"
+    settings = get_settings()
+    thumb_status = "✅ Set hai" if os.path.exists(THUMBNAIL_PATH) else "❌ Nahi"
+    limit = settings.get("daily_limit", 5)
+    del_sec = settings.get("auto_delete_seconds", 0)
+    del_str = f"{del_sec}s" if del_sec else "Off"
 
     keyboard = [
         [InlineKeyboardButton("✏️ Start Message", callback_data="admin_setstartmsg"),
          InlineKeyboardButton("🖼 Thumbnail", callback_data="admin_setthumb")],
+        [InlineKeyboardButton(f"📥 Daily Limit: {limit}", callback_data="admin_setlimit"),
+         InlineKeyboardButton(f"⏱ Auto Delete: {del_str}", callback_data="admin_setdelete")],
+        [InlineKeyboardButton("🗑 Delete Notice Msg", callback_data="admin_setdelmsg"),
+         InlineKeyboardButton("📩 After Delete Msg", callback_data="admin_setafterdelmsg")],
         [InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
          InlineKeyboardButton("👥 Users List", callback_data="admin_users")],
         [InlineKeyboardButton("🚫 Ban User", callback_data="admin_ban"),
@@ -380,16 +515,24 @@ async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 Stats", callback_data="admin_stats")],
     ]
 
-    await update.message.reply_text(
+    text = (
         "🛠 *Admin Panel*\n\n"
         f"👥 Total Users: `{len(users)}`\n"
         f"🚫 Banned: `{len(banned)}`\n"
-        f"⏳ Pending requests: `{pending}`\n"
-        f"🖼 Thumbnail: {thumb_status}\n\n"
-        "Neeche se option chuno:",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        f"⏳ Pending: `{pending}`\n"
+        f"🖼 Thumbnail: {thumb_status}\n"
+        f"📥 Daily Limit: `{limit}` videos\n"
+        f"⏱ Auto Delete: `{del_str}`\n\n"
+        "Option chuno:"
     )
+
+    msg = update.message or (update.callback_query.message if update.callback_query else None)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await msg.reply_text(text, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -403,122 +546,118 @@ async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    if data == "admin_stats":
+    if data == "admin_back":
+        await show_admin_panel(update, context)
+
+    elif data == "admin_stats":
         users = get_all_users()
         banned = get_banned()
         pending = sum(1 for k in context.bot_data if str(k).startswith("pending_"))
         await query.edit_message_text(
-            "📊 *Stats*\n\n"
-            f"👥 Total Users: `{len(users)}`\n"
-            f"🚫 Banned Users: `{len(banned)}`\n"
-            f"⏳ Pending requests: `{pending}`\n"
-            f"🖼 Thumbnail: {'✅' if os.path.exists(THUMBNAIL_PATH) else '❌'}",
+            f"📊 *Stats*\n\n👥 Users: `{len(users)}`\n🚫 Banned: `{len(banned)}`\n⏳ Pending: `{pending}`\n🖼 Thumb: {'✅' if os.path.exists(THUMBNAIL_PATH) else '❌'}",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data="admin_back")
-            ]])
-        )
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
 
     elif data == "admin_users":
         users = get_all_users()
         banned = get_banned()
         text = "👥 *Users List:*\n\n"
         for uid, name in list(users.items())[:30]:
-            ban_mark = " 🚫" if int(uid) in banned else ""
-            text += f"• {name}{ban_mark} (`{uid}`)\n"
+            mark = " 🚫" if int(uid) in banned else ""
+            text += f"• {name}{mark} (`{uid}`)\n"
         if len(users) > 30:
             text += f"\n...aur {len(users)-30} users"
         await query.edit_message_text(text, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔙 Back", callback_data="admin_back")
-            ]]))
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="admin_back")]]))
 
     elif data == "admin_setstartmsg":
         context.user_data["admin_action"] = "set_start_msg"
         await query.edit_message_text(
-            "✏️ *Start Message Set Karo*\n\n"
-            "Naya start message bhejo.\n"
-            "`{name}` likhne pe user ka naam aa jayega.\n\n"
-            "Example:\n`👋 Namaste {name}! Welcome to our bot.`\n\n"
-            "/cancel se wapas jao.",
-            parse_mode="Markdown"
-        )
+            "✏️ *Start Message Set Karo*\n\n`{name}` likhne pe user ka naam aayega.\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
 
     elif data == "admin_setthumb":
         context.user_data["admin_action"] = "set_thumb"
         await query.edit_message_text(
-            "🖼 *Thumbnail Set Karo*\n\n"
-            "Ab mujhe ek photo bhejo — woh thumbnail ban jayega.\n\n"
-            "/cancel se wapas jao.",
-            parse_mode="Markdown"
-        )
+            "🖼 *Thumbnail Set Karo*\n\nEk photo bhejo — woh thumbnail ban jayega.\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
+
+    elif data == "admin_setlimit":
+        context.user_data["admin_action"] = "set_limit"
+        settings = get_settings()
+        await query.edit_message_text(
+            f"📥 *Daily Download Limit Set Karo*\n\nAbhi: `{settings.get('daily_limit', 5)}`\n\n"
+            "Number bhejo (jaise `5`).\n`0` likhne pe unlimited ho jayega.\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
+
+    elif data == "admin_setdelete":
+        context.user_data["admin_action"] = "set_delete"
+        settings = get_settings()
+        await query.edit_message_text(
+            f"⏱ *Auto Delete Time Set Karo*\n\nAbhi: `{settings.get('auto_delete_seconds', 0)}` seconds\n\n"
+            "Seconds mein number bhejo:\n"
+            "• `300` = 5 minute\n• `3600` = 1 ghanta\n• `0` = auto delete off\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
+
+    elif data == "admin_setdelmsg":
+        context.user_data["admin_action"] = "set_del_msg"
+        settings = get_settings()
+        await query.edit_message_text(
+            f"🗑 *Delete Notice Message Set Karo*\n\nJab file bhejo tab yeh message aata hai.\n"
+            f"`{{time}}` likhne pe time aayega.\n\nAbhi:\n`{settings.get('delete_msg', '')}`\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
+
+    elif data == "admin_setafterdelmsg":
+        context.user_data["admin_action"] = "set_after_del_msg"
+        settings = get_settings()
+        await query.edit_message_text(
+            f"📩 *After Delete Message Set Karo*\n\nFile delete hone ke baad yeh message aayega.\n\n"
+            f"Abhi:\n`{settings.get('after_delete_msg', '')}`\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
 
     elif data == "admin_broadcast":
         context.user_data["admin_action"] = "broadcast"
         await query.edit_message_text(
-            "📢 *Broadcast Message*\n\n"
-            "Woh message bhejo jo sab users ko bhejna hai.\n"
-            "Text, photo, video sab chalega.\n\n"
-            "/cancel se wapas jao.",
-            parse_mode="Markdown"
-        )
+            "📢 *Broadcast Message*\n\nMessage bhejo (text/photo/video).\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
 
     elif data == "admin_ban":
         context.user_data["admin_action"] = "ban"
         await query.edit_message_text(
-            "🚫 *Ban User*\n\n"
-            "User ka ID bhejo jise ban karna hai.\n"
-            "Example: `123456789`\n\n"
-            "/cancel se wapas jao.",
-            parse_mode="Markdown"
-        )
+            "🚫 *Ban User*\n\nUser ka ID bhejo.\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
 
     elif data == "admin_unban":
         context.user_data["admin_action"] = "unban"
         await query.edit_message_text(
-            "✅ *Unban User*\n\n"
-            "User ka ID bhejo jise unban karna hai.\n"
-            "Example: `123456789`\n\n"
-            "/cancel se wapas jao.",
-            parse_mode="Markdown"
-        )
-
-    elif data == "admin_back":
-        await admin(update, context)
+            "✅ *Unban User*\n\nUser ka ID bhejo.\n\n/cancel se wapas jao.",
+            parse_mode="Markdown")
 
 
 async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    # Non-admin — seedha user handler pe bhejo
     if not is_admin(user.id):
         await handle_user_message(update, context)
         return
 
     action = context.user_data.get("admin_action")
     if not action:
-        # Admin ne koi admin action set nahi kiya — normal user ki tarah handle karo
         await handle_user_message(update, context)
         return
 
     msg = update.message
+    settings = get_settings()
 
-    # ── Set Start Message ──────────────────────────────────
     if action == "set_start_msg":
         if msg.text:
-            settings = get_settings()
             settings["start_msg"] = msg.text
             save_settings(settings)
             context.user_data.pop("admin_action", None)
-            await msg.reply_text(
-                "✅ *Start message update ho gaya!*\n\n"
-                f"Preview:\n{msg.text.replace('{name}', user.first_name)}",
-                parse_mode="Markdown"
-            )
+            await msg.reply_text("✅ Start message update ho gaya!", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ Sirf text message bhejo!")
+            await msg.reply_text("⚠️ Sirf text bhejo!")
 
-    # ── Set Thumbnail ──────────────────────────────────────
     elif action == "set_thumb":
         if msg.photo:
             photo = msg.photo[-1]
@@ -529,14 +668,49 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await msg.reply_text("⚠️ Photo bhejo!")
 
-    # ── Broadcast ──────────────────────────────────────────
+    elif action == "set_limit":
+        if msg.text and msg.text.strip().isdigit():
+            settings["daily_limit"] = int(msg.text.strip())
+            save_settings(settings)
+            context.user_data.pop("admin_action", None)
+            lim = settings["daily_limit"]
+            await msg.reply_text(f"✅ Daily limit set: `{'Unlimited' if lim == 0 else lim}`", parse_mode="Markdown")
+        else:
+            await msg.reply_text("⚠️ Sirf number bhejo!")
+
+    elif action == "set_delete":
+        if msg.text and msg.text.strip().isdigit():
+            settings["auto_delete_seconds"] = int(msg.text.strip())
+            save_settings(settings)
+            context.user_data.pop("admin_action", None)
+            sec = settings["auto_delete_seconds"]
+            await msg.reply_text(f"✅ Auto delete: `{'Off' if sec == 0 else f'{sec} seconds'}`", parse_mode="Markdown")
+        else:
+            await msg.reply_text("⚠️ Sirf number (seconds) bhejo!")
+
+    elif action == "set_del_msg":
+        if msg.text:
+            settings["delete_msg"] = msg.text
+            save_settings(settings)
+            context.user_data.pop("admin_action", None)
+            await msg.reply_text("✅ Delete notice message set ho gaya!")
+        else:
+            await msg.reply_text("⚠️ Text bhejo!")
+
+    elif action == "set_after_del_msg":
+        if msg.text:
+            settings["after_delete_msg"] = msg.text
+            save_settings(settings)
+            context.user_data.pop("admin_action", None)
+            await msg.reply_text("✅ After-delete message set ho gaya!")
+        else:
+            await msg.reply_text("⚠️ Text bhejo!")
+
     elif action == "broadcast":
         users = get_all_users()
         context.user_data.pop("admin_action", None)
-        sent = 0
-        failed = 0
+        sent = failed = 0
         status_msg = await msg.reply_text(f"📢 Broadcasting {len(users)} users ko...")
-
         for uid_str in users:
             uid = int(uid_str)
             if is_banned(uid):
@@ -554,78 +728,50 @@ async def handle_admin_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await asyncio.sleep(0.05)
             except Exception:
                 failed += 1
+        await status_msg.edit_text(f"📢 *Done!*\n✅ Sent: `{sent}`\n❌ Failed: `{failed}`", parse_mode="Markdown")
 
-        await status_msg.edit_text(
-            f"📢 *Broadcast Complete!*\n\n"
-            f"✅ Sent: `{sent}`\n❌ Failed: `{failed}`",
-            parse_mode="Markdown"
-        )
-
-    # ── Ban ────────────────────────────────────────────────
     elif action == "ban":
         if msg.text and msg.text.strip().isdigit():
             uid = int(msg.text.strip())
             ban_user(uid)
             context.user_data.pop("admin_action", None)
-            await msg.reply_text(f"🚫 User `{uid}` ban ho gaya!", parse_mode="Markdown")
+            await msg.reply_text(f"🚫 User `{uid}` ban!", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ Sirf user ID (number) bhejo!")
+            await msg.reply_text("⚠️ User ID (number) bhejo!")
 
-    # ── Unban ──────────────────────────────────────────────
     elif action == "unban":
         if msg.text and msg.text.strip().isdigit():
             uid = int(msg.text.strip())
             unban_user(uid)
             context.user_data.pop("admin_action", None)
-            await msg.reply_text(f"✅ User `{uid}` unban ho gaya!", parse_mode="Markdown")
+            await msg.reply_text(f"✅ User `{uid}` unban!", parse_mode="Markdown")
         else:
-            await msg.reply_text("⚠️ Sirf user ID (number) bhejo!")
+            await msg.reply_text("⚠️ User ID (number) bhejo!")
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("admin_action", None)
-    await update.message.reply_text("❌ Action cancel ho gaya.")
+    await update.message.reply_text("❌ Cancel ho gaya.")
     if is_admin(update.effective_user.id):
         await admin(update, context)
 
-
-# ── Direct commands ────────────────────────────────────────
 async def ban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    if not is_admin(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("Usage: `/ban USER_ID`", parse_mode="Markdown")
-        return
-    uid = int(context.args[0])
-    ban_user(uid)
-    await update.message.reply_text(f"🚫 User `{uid}` ban ho gaya!", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/ban USER_ID`", parse_mode="Markdown"); return
+    ban_user(int(context.args[0]))
+    await update.message.reply_text(f"🚫 User `{context.args[0]}` ban!", parse_mode="Markdown")
 
 async def unban_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    if not is_admin(update.effective_user.id): return
     if not context.args:
-        await update.message.reply_text("Usage: `/unban USER_ID`", parse_mode="Markdown")
-        return
-    uid = int(context.args[0])
-    unban_user(uid)
-    await update.message.reply_text(f"✅ User `{uid}` unban ho gaya!", parse_mode="Markdown")
+        await update.message.reply_text("Usage: `/unban USER_ID`", parse_mode="Markdown"); return
+    unban_user(int(context.args[0]))
+    await update.message.reply_text(f"✅ User `{context.args[0]}` unban!", parse_mode="Markdown")
 
 async def get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
-    await update.message.reply_text(
-        f"Chat ID: `{chat.id}`\nType: {chat.type}\nTitle: {chat.title or 'N/A'}",
-        parse_mode="Markdown")
-
-async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    users = get_all_users()
-    banned = get_banned()
-    pending = sum(1 for k in context.bot_data if str(k).startswith("pending_"))
-    await update.message.reply_text(
-        f"📊 Users: `{len(users)}` | Banned: `{len(banned)}` | Pending: `{pending}`",
-        parse_mode="Markdown")
-
+    await update.message.reply_text(f"ID: `{chat.id}`\nType: {chat.type}", parse_mode="Markdown")
 
 # ════════════════════════════════════════════════════════════
 #  MAIN
@@ -634,13 +780,11 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def run():
     global telethon_client
 
-    for var, val in [("BOT_TOKEN", BOT_TOKEN), ("WEBHOOK_URL", WEBHOOK_URL)]:
-        if not val:
-            raise ValueError(f"{var} set nahi hai!")
-    if not DB_CHANNEL_ID:
-        raise ValueError("DB_CHANNEL_ID set nahi hai!")
+    if not BOT_TOKEN: raise ValueError("BOT_TOKEN missing!")
+    if not WEBHOOK_URL: raise ValueError("WEBHOOK_URL missing!")
+    if not DB_CHANNEL_ID: raise ValueError("DB_CHANNEL_ID missing!")
     if not API_ID or not API_HASH or not SESSION_STRING:
-        raise ValueError("API_ID / API_HASH / SESSION_STRING set nahi hai!")
+        raise ValueError("API_ID/API_HASH/SESSION_STRING missing!")
 
     telethon_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
     await telethon_client.start()
@@ -649,36 +793,25 @@ async def run():
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("admin", admin))
     app.add_handler(CommandHandler("ban", ban_cmd))
     app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("getid", get_id))
-    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("cancel", cancel))
-
-    from telegram.ext import CallbackQueryHandler
     app.add_handler(CallbackQueryHandler(admin_callback, pattern="^admin_"))
-
-    # Private messages — admin input ya user link
-    app.add_handler(MessageHandler(
-        filters.ChatType.PRIVATE & ~filters.COMMAND,
-        handle_admin_input
-    ))
-
-    # Channel posts
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_admin_input))
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL, handle_channel_post))
 
     webhook_path = f"/webhook/{BOT_TOKEN}"
-    full_webhook_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
-    logger.info(f"Webhook: {full_webhook_url} | Port: {PORT}")
+    full_url = f"{WEBHOOK_URL.rstrip('/')}{webhook_path}"
+    logger.info(f"Webhook: {full_url} | Port: {PORT}")
 
     await app.initialize()
     await app.start()
     await app.updater.start_webhook(
         listen="0.0.0.0", port=PORT,
-        url_path=webhook_path, webhook_url=full_webhook_url,
+        url_path=webhook_path, webhook_url=full_url,
         drop_pending_updates=True,
     )
     logger.info("✅ Bot chal raha hai!")
@@ -690,7 +823,6 @@ async def run():
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(run())
