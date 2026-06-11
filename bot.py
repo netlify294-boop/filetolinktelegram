@@ -398,7 +398,7 @@ async def process_final_video(source_chat_id, file_ref, caption, bot_data):
         kb = [[InlineKeyboardButton("📥 Get File", url=link)]]
         await app.bot.send_message(
             chat_id=final_chat,
-            text=f"🎬 *Video Available!*\n\n{caption[:60] + chr(10) if caption else ''}🔗 *Download Link:*\n`{link}`",
+                    text="\U0001f3ac Video Available!\n\n\U0001f517 Download Link:\n`" + link + "`",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(kb)
         )
@@ -699,12 +699,67 @@ async def run():
             return
         pending_key = next(iter(thumb_pending))
         data = thumb_pending.pop(pending_key)
-        await process_final_video(
-            FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else DB_CHANNEL_ID,
-            msg.id,
-            data["caption"],
-            data["bot_data"]
-        )
+
+        target_ch = FINAL_CHANNEL_ID if FINAL_CHANNEL_ID else DB_CHANNEL_ID
+
+        try:
+            # ThumbBot ke chat se target channel pe forward karo (Telethon se)
+            fwd = await telethon_client.send_file(
+                target_ch,
+                file=msg.media,
+                caption=data["caption"],
+                supports_streaming=True
+            )
+            final_ref = fwd.id
+            processed_msg_ids.add(final_ref)
+            logger.info(f"ThumbBot video channel pe: msg_id={final_ref}")
+
+            file_arg = make_file_arg(final_ref)
+            link = f"https://t.me/{BOT_USERNAME}?start={file_arg}"
+            logger.info(f"Link bana: {link}")
+
+            app = application_ref[0]
+            kb = [[InlineKeyboardButton("📥 Get File", url=link)]]
+
+            # Channel pe link message
+            try:
+                await app.bot.send_message(
+                    chat_id=target_ch,
+                    text="\U0001f3ac Video Available!\n\n\U0001f517 Download Link:\n`" + link + "`",
+
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(kb)
+                )
+            except Exception as e:
+                logger.error(f"Channel link msg error: {e}")
+
+            # Pending users notify karo
+            bot_data = data["bot_data"]
+            notified = []
+            for key, udata in list(bot_data.items()):
+                if not str(key).startswith("pending_"):
+                    continue
+                uid = int(str(key).replace("pending_", ""))
+                try:
+                    await app.bot.send_message(
+                        chat_id=udata["chat_id"],
+                        text="\u2705 *Video ready hai!*\n\n\U0001f517 *Download Link:*\n`" + link + "`",
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Video Download Karo", url=link)]])
+                    )
+                    try:
+                        await app.bot.delete_message(chat_id=udata["chat_id"], message_id=udata["msg_id"])
+                    except Exception:
+                        pass
+                    notified.append(key)
+                    logger.info(f"User {uid} notify kiya")
+                except Exception as e:
+                    logger.error(f"Notify error {uid}: {e}")
+            for k in notified:
+                bot_data.pop(k, None)
+
+        except Exception as e:
+            logger.error(f"ThumbBot response process error: {e}")
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     application_ref.append(app)
